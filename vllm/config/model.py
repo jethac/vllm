@@ -80,16 +80,6 @@ else:
 
 logger = init_logger(__name__)
 
-
-def is_cumem_allocator_available() -> bool:
-    try:
-        from vllm.device_allocator.cumem import cumem_available
-    except ImportError:
-        return False
-
-    return cumem_available
-
-
 RunnerOption = Literal["auto", RunnerType]
 ConvertType = Literal["none", "embed", "classify"]
 ConvertOption = Literal["auto", ConvertType]
@@ -540,11 +530,14 @@ class ModelConfig:
             if not current_platform.is_sleep_mode_available():
                 raise ValueError("Sleep mode is not supported on current platform.")
             if not self.enable_cumem_allocator:
-                raise ValueError(
-                    "Sleep mode requires the cumem allocator. "
-                    "Remove --no-enable-cumem-allocator to use sleep mode."
+                logger.info_once(
+                    "Enabling cumem allocator because sleep mode requires it."
                 )
-        if self.enable_cumem_allocator and not is_cumem_allocator_available():
+                self.enable_cumem_allocator = True
+        if (
+            self.enable_cumem_allocator
+            and not current_platform.is_cumem_allocator_available()
+        ):
             raise ValueError("cumem allocator is not supported on current platform.")
 
         hf_config = get_config(
