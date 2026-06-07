@@ -7,9 +7,11 @@ pynvml. However, it should not initialize cuda context.
 from __future__ import annotations
 
 import os
+import sys
 from collections.abc import Callable
 from datetime import timedelta
 from functools import cache, lru_cache, wraps
+from importlib import import_module
 from typing import TYPE_CHECKING, TypeVar
 
 import torch
@@ -19,7 +21,28 @@ from typing_extensions import ParamSpec
 
 # import custom ops, trigger op registration
 import vllm._C  # noqa
-import vllm._C_stable_libtorch  # noqa
+
+
+def _import_stable_libtorch() -> None:
+    try:
+        import vllm._C_stable_libtorch  # noqa: F401
+    except ImportError:
+        # Some SM12x source builds can expose extension symbols that are not
+        # used by this platform path. Retry with lazy symbol binding so CUDA
+        # platform import is not blocked by unused kernels.
+        if not hasattr(sys, "getdlopenflags"):
+            raise
+        old_flags = sys.getdlopenflags()
+        lazy = getattr(os, "RTLD_LAZY", 1)
+        global_ = getattr(os, "RTLD_GLOBAL", 0)
+        sys.setdlopenflags(old_flags | lazy | global_)
+        try:
+            import_module("vllm._C_stable_libtorch")
+        finally:
+            sys.setdlopenflags(old_flags)
+
+
+_import_stable_libtorch()
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.utils.import_utils import import_pynvml
