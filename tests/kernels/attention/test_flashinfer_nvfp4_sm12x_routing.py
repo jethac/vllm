@@ -81,3 +81,25 @@ def test_flashinfer_decode_wrapper_backend_for_nvfp4_sm12x(
     wrapper = builder._get_decode_wrapper(batch_size=1, use_cudagraph=False)
 
     assert wrapper.backend == expected_backend
+
+
+def test_flashinfer_nvfp4_sm12x_enables_v_scale_deswizzle(monkeypatch):
+    monkeypatch.delenv("FLASHINFER_EXTRA_CUDAFLAGS", raising=False)
+
+    flashinfer_backend._ensure_vllm_nvfp4_kv_deswizzle_flag()
+
+    assert (
+        "-DFLASHINFER_PAGED_V_SF_DESWIZZLE=1"
+        in flashinfer_backend.os.environ["FLASHINFER_EXTRA_CUDAFLAGS"]
+    )
+
+
+def test_flashinfer_nvfp4_sm12x_preserves_existing_cuda_flags(monkeypatch):
+    monkeypatch.setenv("FLASHINFER_EXTRA_CUDAFLAGS", "-lineinfo")
+
+    flashinfer_backend._ensure_vllm_nvfp4_kv_deswizzle_flag()
+    flashinfer_backend._ensure_vllm_nvfp4_kv_deswizzle_flag()
+
+    flags = flashinfer_backend.os.environ["FLASHINFER_EXTRA_CUDAFLAGS"]
+    assert "-lineinfo" in flags
+    assert flags.count("FLASHINFER_PAGED_V_SF_DESWIZZLE") == 1

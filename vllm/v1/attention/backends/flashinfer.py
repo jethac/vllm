@@ -4,6 +4,7 @@
 
 from dataclasses import dataclass
 from functools import partial
+import os
 from typing import ClassVar
 
 import numpy as np
@@ -77,6 +78,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.utils import CpuGpuBuffer
 
 FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT = 2048 * 1024 * 1024
+VLLM_NVFP4_V_SF_DESWIZZLE_FLAG = "-DFLASHINFER_PAGED_V_SF_DESWIZZLE=1"
 
 FP8_DTYPE = current_platform.fp8_dtype()
 FP4_DTYPE = torch.uint8
@@ -84,6 +86,15 @@ FP4_DTYPE = torch.uint8
 logger = init_logger(__name__)
 
 trtllm_gen_workspace_buffer = None
+
+
+def _ensure_vllm_nvfp4_kv_deswizzle_flag() -> None:
+    extra_flags = os.environ.get("FLASHINFER_EXTRA_CUDAFLAGS", "")
+    if "FLASHINFER_PAGED_V_SF_DESWIZZLE" in extra_flags:
+        return
+    os.environ["FLASHINFER_EXTRA_CUDAFLAGS"] = (
+        f"{extra_flags} {VLLM_NVFP4_V_SF_DESWIZZLE_FLAG}".strip()
+    )
 
 
 def _get_trtllm_gen_workspace_buffer():
@@ -686,8 +697,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 "FlashInfer FA2 NVFP4 KV on SM12x is not wired for DCP yet."
             )
         if self.use_fa2_nvfp4_kv:
+            _ensure_vllm_nvfp4_kv_deswizzle_flag()
             logger.info_once(
-                "Using FlashInfer FA2 backend for NVFP4 KV cache on SM12x."
+                "Using FlashInfer FA2 backend for NVFP4 KV cache on SM12x "
+                "with vLLM V-scale-factor deswizzle enabled."
             )
 
         self._cascade_wrapper = None  # Wrapper for cascade attention
@@ -1334,6 +1347,8 @@ class FlashInferImpl(AttentionImpl):
             self.is_kvcache_nvfp4
             and current_platform.is_device_capability_family(120)
         )
+        if self.use_fa2_nvfp4_kv:
+            _ensure_vllm_nvfp4_kv_deswizzle_flag()
         self.fp4_data_dim = head_size // 2 if self.is_kvcache_nvfp4 else 0
         self.logits_soft_cap = logits_soft_cap
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
