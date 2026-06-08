@@ -202,6 +202,45 @@ def _spark_kv_trace_views_info(
     return [_spark_kv_trace_view_info(view) for view in views]
 
 
+def _spark_trace_scalar(value: object) -> float | int | str | None:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                return f"<tensor:{list(value.shape)}>"
+            return float(value.detach().cpu().item())
+        if isinstance(value, (float, int)):
+            return value
+        return float(value)  # type: ignore[arg-type]
+    except Exception as exc:
+        return f"<scalar_error:{type(exc).__name__}>"
+
+
+def _spark_tensor_trace_view_payload(
+    tensor: torch.Tensor | None,
+) -> dict[str, object] | None:
+    if tensor is None:
+        return None
+    head_tensor = tensor
+    if tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        head_tensor = tensor.view(torch.uint8)
+    return {
+        "view": _spark_kv_trace_view_info(tensor),
+        "head": _spark_kv_trace_tensor_head(head_tensor),
+    }
+
+
+def _spark_tensor_trace_tuple_payload(
+    tensors: tuple[torch.Tensor, ...] | torch.Tensor | None,
+) -> list[dict[str, object] | None] | dict[str, object] | None:
+    if tensors is None:
+        return None
+    if isinstance(tensors, tuple):
+        return [_spark_tensor_trace_view_payload(tensor) for tensor in tensors]
+    return _spark_tensor_trace_view_payload(tensors)
+
+
 def _spark_kv_trace_slot_samples(
     data_views: tuple[torch.Tensor, ...] | None,
     scale_views: tuple[torch.Tensor, ...] | None,
@@ -1923,6 +1962,41 @@ class FlashInferImpl(AttentionImpl):
                     else:
                         out_prefill = output[num_decode_tokens:]
 
+                    if spark_tensor_trace_should_emit(
+                        "flashinfer_wrapper_prefill_pre", layer_name
+                    ):
+                        spark_tensor_trace(
+                            "flashinfer_wrapper_prefill_pre",
+                            {
+                                "layer_name": layer_name,
+                                "kv_cache_dtype": str(self.kv_cache_dtype),
+                                "is_kvcache_nvfp4": bool(self.is_kvcache_nvfp4),
+                                "use_fa2_nvfp4_kv": bool(self.use_fa2_nvfp4_kv),
+                                "needs_fp8_out": bool(needs_fp8_out_prefill),
+                                "wrapper_type": type(prefill_wrapper).__name__,
+                                "window_left": int(self.window_left),
+                                "head_dim": int(self.head_size),
+                                "num_q_heads": int(self.num_heads),
+                                "num_kv_heads": int(self.num_kv_heads),
+                                "num_prefill_tokens": int(num_prefill_tokens),
+                                "num_decode_tokens": int(num_decode_tokens),
+                                "k_scale": _spark_trace_scalar(layer._k_scale_float),
+                                "v_scale": _spark_trace_scalar(layer._v_scale_float),
+                                "query_last": spark_trace_last_token_summary(
+                                    prefill_query
+                                ),
+                                "kv_cache_arg": _spark_tensor_trace_tuple_payload(
+                                    kv_cache_permute
+                                ),
+                                "kv_cache_sf": _spark_tensor_trace_tuple_payload(
+                                    kv_cache_sf
+                                ),
+                                "out_before": spark_trace_last_token_summary(
+                                    out_prefill
+                                ),
+                            },
+                        )
+
                     prefill_wrapper.run(
                         prefill_query,
                         kv_cache_permute,
@@ -1931,6 +2005,32 @@ class FlashInferImpl(AttentionImpl):
                         out=out_prefill,
                         kv_cache_sf=kv_cache_sf,
                     )
+
+                    if spark_tensor_trace_should_emit(
+                        "flashinfer_wrapper_prefill_post", layer_name
+                    ):
+                        spark_tensor_trace(
+                            "flashinfer_wrapper_prefill_post",
+                            {
+                                "layer_name": layer_name,
+                                "kv_cache_dtype": str(self.kv_cache_dtype),
+                                "is_kvcache_nvfp4": bool(self.is_kvcache_nvfp4),
+                                "use_fa2_nvfp4_kv": bool(self.use_fa2_nvfp4_kv),
+                                "needs_fp8_out": bool(needs_fp8_out_prefill),
+                                "wrapper_type": type(prefill_wrapper).__name__,
+                                "window_left": int(self.window_left),
+                                "head_dim": int(self.head_size),
+                                "num_q_heads": int(self.num_heads),
+                                "num_kv_heads": int(self.num_kv_heads),
+                                "num_prefill_tokens": int(num_prefill_tokens),
+                                "num_decode_tokens": int(num_decode_tokens),
+                                "k_scale": _spark_trace_scalar(layer._k_scale_float),
+                                "v_scale": _spark_trace_scalar(layer._v_scale_float),
+                                "out_after": spark_trace_last_token_summary(
+                                    out_prefill
+                                ),
+                            },
+                        )
 
                     if needs_fp8_out_prefill:
                         output[
@@ -2094,6 +2194,40 @@ class FlashInferImpl(AttentionImpl):
                         get_dcp_group(),
                     )
                 else:
+                    if spark_tensor_trace_should_emit(
+                        "flashinfer_wrapper_decode_pre", layer_name
+                    ):
+                        spark_tensor_trace(
+                            "flashinfer_wrapper_decode_pre",
+                            {
+                                "layer_name": layer_name,
+                                "kv_cache_dtype": str(self.kv_cache_dtype),
+                                "is_kvcache_nvfp4": bool(self.is_kvcache_nvfp4),
+                                "use_fa2_nvfp4_kv": bool(self.use_fa2_nvfp4_kv),
+                                "needs_fp8_out": bool(needs_fp8_out),
+                                "wrapper_type": type(decode_wrapper).__name__,
+                                "window_left": int(self.window_left),
+                                "head_dim": int(self.head_size),
+                                "num_q_heads": int(self.num_heads),
+                                "num_kv_heads": int(self.num_kv_heads),
+                                "num_decode_tokens": int(num_decode_tokens),
+                                "k_scale": _spark_trace_scalar(layer._k_scale_float),
+                                "v_scale": _spark_trace_scalar(layer._v_scale_float),
+                                "query_last": spark_trace_last_token_summary(
+                                    decode_query
+                                ),
+                                "kv_cache_arg": _spark_tensor_trace_tuple_payload(
+                                    kv_cache_permute
+                                ),
+                                "kv_cache_sf": _spark_tensor_trace_tuple_payload(
+                                    kv_cache_sf
+                                ),
+                                "out_before": spark_trace_last_token_summary(
+                                    out_decode
+                                ),
+                            },
+                        )
+
                     decode_wrapper.run(
                         decode_query,
                         kv_cache_permute,
@@ -2102,6 +2236,31 @@ class FlashInferImpl(AttentionImpl):
                         out=out_decode,
                         kv_cache_sf=kv_cache_sf,
                     )
+
+                    if spark_tensor_trace_should_emit(
+                        "flashinfer_wrapper_decode_post", layer_name
+                    ):
+                        spark_tensor_trace(
+                            "flashinfer_wrapper_decode_post",
+                            {
+                                "layer_name": layer_name,
+                                "kv_cache_dtype": str(self.kv_cache_dtype),
+                                "is_kvcache_nvfp4": bool(self.is_kvcache_nvfp4),
+                                "use_fa2_nvfp4_kv": bool(self.use_fa2_nvfp4_kv),
+                                "needs_fp8_out": bool(needs_fp8_out),
+                                "wrapper_type": type(decode_wrapper).__name__,
+                                "window_left": int(self.window_left),
+                                "head_dim": int(self.head_size),
+                                "num_q_heads": int(self.num_heads),
+                                "num_kv_heads": int(self.num_kv_heads),
+                                "num_decode_tokens": int(num_decode_tokens),
+                                "k_scale": _spark_trace_scalar(layer._k_scale_float),
+                                "v_scale": _spark_trace_scalar(layer._v_scale_float),
+                                "out_after": spark_trace_last_token_summary(
+                                    out_decode
+                                ),
+                            },
+                        )
 
                 if needs_fp8_out:
                     output[:num_decode_tokens].copy_(out_decode.to(output.dtype))
