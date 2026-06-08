@@ -1953,6 +1953,15 @@ class FlashInferImpl(AttentionImpl):
             live_disable_split_kv = bool(
                 getattr(live_wrapper, "vllm_disable_split_kv", False)
             )
+            replay_q_data_type = getattr(
+                live_wrapper, "_cached_q_data_type", prefill_query.dtype
+            )
+            replay_kv_data_type = getattr(
+                live_wrapper, "_cached_kv_data_type", self.kv_cache_dtype
+            )
+            replay_o_data_type = getattr(
+                live_wrapper, "_cached_o_data_type", prefill_query.dtype
+            )
             fresh_wrapper.plan(
                 qo_indptr=qo_indptr,
                 paged_kv_indptr=paged_kv_indptr,
@@ -1968,9 +1977,9 @@ class FlashInferImpl(AttentionImpl):
                 sm_scale=self.scale,
                 window_left=self.window_left,
                 logits_soft_cap=self.logits_soft_cap,
-                q_data_type=prefill_query.dtype,
-                kv_data_type=self.kv_cache_dtype,
-                o_data_type=prefill_query.dtype,
+                q_data_type=replay_q_data_type,
+                kv_data_type=replay_kv_data_type,
+                o_data_type=replay_o_data_type,
                 fixed_split_size=live_fixed_split_size,
                 disable_split_kv=live_disable_split_kv,
             )
@@ -1990,6 +1999,9 @@ class FlashInferImpl(AttentionImpl):
                     "workspace_mb": workspace_mb,
                     "fixed_split_size": live_fixed_split_size,
                     "disable_split_kv": live_disable_split_kv,
+                    "q_data_type": str(replay_q_data_type),
+                    "kv_data_type": str(replay_kv_data_type),
+                    "o_data_type": str(replay_o_data_type),
                     "fresh_out": spark_trace_last_token_summary(fresh_out),
                     "fresh_vs_live": _spark_tensor_trace_compare_payload(
                         fresh_out, live_out
