@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -292,6 +293,20 @@ class Attention(nn.Module, AttentionLayerBase):
         self.num_kv_heads = num_kv_heads
         self.sliding_window = sliding_window
         self.has_sink = extra_impl_args.get("sinks") is not None
+        if os.environ.get("VLLM_SPARK_KV_GEOMETRY_LOG") == "1":
+            logger.info(
+                "SPARK_GEMMA_KV_GEOMETRY layer=%s heads=%s kv_heads=%s "
+                "head_dim=%s head_dim_v=%s sliding_window=%s "
+                "kv_cache_dtype=%s torch_dtype=%s",
+                prefix,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_size,
+                self.head_size_v,
+                self.sliding_window,
+                self.kv_cache_dtype,
+                self.kv_cache_torch_dtype,
+            )
 
         # NOTE: model_config may be None during certain tests
         model_config = vllm_config.model_config
@@ -563,6 +578,36 @@ class Attention(nn.Module, AttentionLayerBase):
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.attn_backend
 
+    def _maybe_log_kv_cache_spec(self, spec: KVCacheSpec) -> None:
+        if os.environ.get("VLLM_SPARK_KV_GEOMETRY_LOG") != "1":
+            return
+        kv_quant_mode = getattr(spec, "kv_quant_mode", None)
+        page_size_bytes = getattr(spec, "page_size_bytes", None)
+        block_size = getattr(spec, "block_size", None)
+        bytes_per_token = (
+            page_size_bytes / block_size
+            if page_size_bytes is not None and block_size
+            else None
+        )
+        logger.info(
+            "SPARK_GEMMA_KV_SPEC layer=%s spec=%s block_size=%s "
+            "num_kv_heads=%s head_size=%s head_size_v=%s dtype=%s "
+            "kv_quant_mode=%s sliding_window=%s real_page_size_bytes=%s "
+            "page_size_bytes=%s bytes_per_token=%s",
+            self.layer_name,
+            type(spec).__name__,
+            block_size,
+            getattr(spec, "num_kv_heads", None),
+            getattr(spec, "head_size", None),
+            getattr(spec, "head_size_v", None),
+            getattr(spec, "dtype", None),
+            getattr(kv_quant_mode, "name", kv_quant_mode),
+            getattr(spec, "sliding_window", None),
+            getattr(spec, "real_page_size_bytes", None),
+            page_size_bytes,
+            f"{bytes_per_token:.3f}" if bytes_per_token is not None else None,
+        )
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         # Block size may get updated after model loading, refresh it
         block_size = vllm_config.cache_config.block_size
@@ -573,7 +618,7 @@ class Attention(nn.Module, AttentionLayerBase):
             assert not vllm_config.model_config.use_mla, (
                 "MLA is not supported for slidingwindow"
             )
-            return SlidingWindowSpec(
+            spec = SlidingWindowSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_size,
@@ -582,6 +627,8 @@ class Attention(nn.Module, AttentionLayerBase):
                 kv_quant_mode=quant_mode,
                 sliding_window=self.sliding_window,
             )
+            self._maybe_log_kv_cache_spec(spec)
+            return spec
         elif self.kv_cache_dtype.startswith("turboquant_"):
             from vllm.model_executor.layers.quantization.turboquant.config import (
                 TurboQuantConfig,
@@ -591,7 +638,7 @@ class Attention(nn.Module, AttentionLayerBase):
             tq_config = TurboQuantConfig.from_cache_dtype(
                 self.kv_cache_dtype, self.head_size
             )
-            return TQFullAttentionSpec(
+            spec = TQFullAttentionSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_size,
@@ -599,8 +646,10 @@ class Attention(nn.Module, AttentionLayerBase):
                 dtype=self.kv_cache_torch_dtype,
                 tq_slot_size=tq_config.slot_size_aligned,
             )
+            self._maybe_log_kv_cache_spec(spec)
+            return spec
         else:
-            return FullAttentionSpec(
+            spec = FullAttentionSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_size,
@@ -608,6 +657,8 @@ class Attention(nn.Module, AttentionLayerBase):
                 dtype=self.kv_cache_torch_dtype,
                 kv_quant_mode=quant_mode,
             )
+            self._maybe_log_kv_cache_spec(spec)
+            return spec
 
 
 def maybe_calc_kv_scales(
