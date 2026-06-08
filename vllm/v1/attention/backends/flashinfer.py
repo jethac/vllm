@@ -93,6 +93,7 @@ logger = init_logger(__name__)
 
 trtllm_gen_workspace_buffer = None
 _SPARK_KV_TRACE_COUNTS: dict[tuple[str, str], int] = {}
+_SPARK_ACTIVE_PAGE_DUMP_COUNTS: dict[tuple[str, str], int] = {}
 
 
 def _spark_kv_trace_enabled() -> bool:
@@ -239,6 +240,131 @@ def _spark_tensor_trace_tuple_payload(
     if isinstance(tensors, tuple):
         return [_spark_tensor_trace_view_payload(tensor) for tensor in tensors]
     return _spark_tensor_trace_view_payload(tensors)
+
+
+def _spark_active_page_dump_enabled() -> bool:
+    return os.environ.get("VLLM_SPARK_ACTIVE_PAGE_DUMP") == "1"
+
+
+def _spark_active_page_dump_dir() -> str:
+    return os.environ.get("VLLM_SPARK_ACTIVE_PAGE_DUMP_DIR", "/tmp")
+
+
+def _spark_active_page_dump_limit() -> int:
+    return _spark_kv_trace_int("VLLM_SPARK_ACTIVE_PAGE_DUMP_LIMIT", 4)
+
+
+def _spark_active_page_dump_pages() -> int:
+    return _spark_kv_trace_int("VLLM_SPARK_ACTIVE_PAGE_DUMP_PAGES", 8)
+
+
+def _spark_active_page_dump_should_emit(event: str, layer_name: str | None) -> bool:
+    if not _spark_active_page_dump_enabled():
+        return False
+    if not _spark_kv_trace_wants_layer(layer_name):
+        return False
+    limit = _spark_active_page_dump_limit()
+    if limit == 0:
+        return False
+    key = (event, layer_name or "<none>")
+    count = _SPARK_ACTIVE_PAGE_DUMP_COUNTS.get(key, 0)
+    if count >= limit:
+        return False
+    _SPARK_ACTIVE_PAGE_DUMP_COUNTS[key] = count + 1
+    return True
+
+
+def _spark_active_page_dump_path(
+    event: str,
+    layer_name: str | None,
+    count: int,
+) -> str:
+    safe_layer = (layer_name or "unknown").replace("/", "_").replace(".", "_")
+    safe_layer = safe_layer[-160:]
+    return os.path.join(
+        _spark_active_page_dump_dir(),
+        f"spark_active_page_{event}_{safe_layer}_{count:04d}.pt",
+    )
+
+
+def _spark_active_page_dump_tensor(tensor: torch.Tensor | None) -> torch.Tensor | None:
+    if tensor is None:
+        return None
+    return tensor.detach().cpu()
+
+
+def _spark_active_page_dump(
+    *,
+    event: str,
+    layer_name: str | None,
+    query: torch.Tensor,
+    out_before: torch.Tensor,
+    out_after: torch.Tensor | None,
+    kv_data: tuple[torch.Tensor, ...] | None,
+    kv_scales: tuple[torch.Tensor, ...] | None,
+    wrapper: BatchPrefillWithPagedKVCacheWrapper,
+    k_scale: object,
+    v_scale: object,
+    window_left: int,
+    num_prefill_tokens: int,
+    num_decode_tokens: int,
+) -> None:
+    if not _spark_active_page_dump_should_emit(event, layer_name):
+        return
+    if kv_data is None or kv_scales is None:
+        return
+
+    count = _SPARK_ACTIVE_PAGE_DUMP_COUNTS[(event, layer_name or "<none>")]
+    max_pages = _spark_active_page_dump_pages()
+    try:
+        os.makedirs(_spark_active_page_dump_dir(), exist_ok=True)
+        indptr = getattr(wrapper, "_paged_kv_indptr_buf", None)
+        indices = getattr(wrapper, "_paged_kv_indices_buf", None)
+        last_page_len = getattr(wrapper, "_paged_kv_last_page_len_buf", None)
+        if indptr is None or indices is None or last_page_len is None:
+            return
+
+        indptr_cpu = indptr.detach().cpu()
+        last_page_len_cpu = last_page_len.detach().cpu()
+        num_indices = int(indptr_cpu[-1].item()) if indptr_cpu.numel() else 0
+        indices_cpu = indices[:num_indices].detach().cpu()
+        active_pages = torch.unique(indices_cpu).to(torch.long)
+        if max_pages > 0:
+            active_pages = active_pages[:max_pages]
+
+        payload: dict[str, object] = {
+            "schema": "spark-active-page-prefill-dump/v1",
+            "event": event,
+            "layer_name": layer_name,
+            "window_left": int(window_left),
+            "num_prefill_tokens": int(num_prefill_tokens),
+            "num_decode_tokens": int(num_decode_tokens),
+            "k_scale": _spark_trace_scalar(k_scale),
+            "v_scale": _spark_trace_scalar(v_scale),
+            "query": _spark_active_page_dump_tensor(query),
+            "out_before": _spark_active_page_dump_tensor(out_before),
+            "out_after": _spark_active_page_dump_tensor(out_after),
+            "paged_kv_indptr": indptr_cpu,
+            "paged_kv_indices": indices_cpu,
+            "paged_kv_last_page_len": last_page_len_cpu,
+            "active_pages": active_pages,
+            "kv_data_views": _spark_kv_trace_views_info(kv_data),
+            "kv_scale_views": _spark_kv_trace_views_info(kv_scales),
+            "kv_data_pages": tuple(
+                _spark_active_page_dump_tensor(view[active_pages.to(view.device)])
+                for view in kv_data
+            ),
+            "kv_scale_pages": tuple(
+                _spark_active_page_dump_tensor(view[active_pages.to(view.device)])
+                for view in kv_scales
+            ),
+        }
+        torch.save(payload, _spark_active_page_dump_path(event, layer_name, count))
+    except Exception:
+        logger.exception(
+            "Failed to dump Spark active FlashInfer prefill pages for %s",
+            layer_name,
+        )
 
 
 def _spark_kv_trace_slot_samples(
@@ -1961,6 +2087,11 @@ class FlashInferImpl(AttentionImpl):
                         out_prefill = self._nvfp4_fp8_out[:num_prefill_tokens]
                     else:
                         out_prefill = output[num_decode_tokens:]
+                    dump_out_before = (
+                        out_prefill.detach().clone()
+                        if _spark_active_page_dump_enabled()
+                        else None
+                    )
 
                     if spark_tensor_trace_should_emit(
                         "flashinfer_wrapper_prefill_pre", layer_name
@@ -2005,6 +2136,30 @@ class FlashInferImpl(AttentionImpl):
                         out=out_prefill,
                         kv_cache_sf=kv_cache_sf,
                     )
+
+                    if (
+                        dump_out_before is not None
+                        and isinstance(prefill_wrapper, BatchPrefillWithPagedKVCacheWrapper)
+                    ):
+                        _spark_active_page_dump(
+                            event="prefill",
+                            layer_name=layer_name,
+                            query=prefill_query,
+                            out_before=dump_out_before,
+                            out_after=out_prefill,
+                            kv_data=kv_cache_permute
+                            if isinstance(kv_cache_permute, tuple)
+                            else None,
+                            kv_scales=kv_cache_sf
+                            if isinstance(kv_cache_sf, tuple)
+                            else None,
+                            wrapper=prefill_wrapper,
+                            k_scale=layer._k_scale_float,
+                            v_scale=layer._v_scale_float,
+                            window_left=self.window_left,
+                            num_prefill_tokens=num_prefill_tokens,
+                            num_decode_tokens=num_decode_tokens,
+                        )
 
                     if spark_tensor_trace_should_emit(
                         "flashinfer_wrapper_prefill_post", layer_name
