@@ -100,6 +100,10 @@ def _spark_kv_trace_enabled() -> bool:
     return os.environ.get("VLLM_SPARK_KV_TRACE") == "1"
 
 
+def _spark_nvfp4_prefill_contig_out_enabled() -> bool:
+    return os.environ.get("VLLM_SPARK_NVFP4_PREFILL_CONTIG_OUT") == "1"
+
+
 def _spark_kv_trace_int(name: str, default: int) -> int:
     try:
         return max(0, int(os.environ.get(name, str(default))))
@@ -2087,6 +2091,14 @@ class FlashInferImpl(AttentionImpl):
                         out_prefill = self._nvfp4_fp8_out[:num_prefill_tokens]
                     else:
                         out_prefill = output[num_decode_tokens:]
+                    out_prefill_target = out_prefill
+                    uses_contig_out_prefill = (
+                        self.is_kvcache_nvfp4
+                        and self.use_fa2_nvfp4_kv
+                        and _spark_nvfp4_prefill_contig_out_enabled()
+                    )
+                    if uses_contig_out_prefill:
+                        out_prefill = torch.empty_like(prefill_query)
                     dump_out_before = (
                         out_prefill.detach().clone()
                         if _spark_active_page_dump_enabled()
@@ -2104,6 +2116,7 @@ class FlashInferImpl(AttentionImpl):
                                 "is_kvcache_nvfp4": bool(self.is_kvcache_nvfp4),
                                 "use_fa2_nvfp4_kv": bool(self.use_fa2_nvfp4_kv),
                                 "needs_fp8_out": bool(needs_fp8_out_prefill),
+                                "uses_contig_out": bool(uses_contig_out_prefill),
                                 "wrapper_type": type(prefill_wrapper).__name__,
                                 "window_left": int(self.window_left),
                                 "head_dim": int(self.head_size),
@@ -2123,6 +2136,13 @@ class FlashInferImpl(AttentionImpl):
                                     kv_cache_sf
                                 ),
                                 "out_before": spark_trace_last_token_summary(
+                                    out_prefill
+                                ),
+                                "output_view": _spark_tensor_trace_view_payload(output),
+                                "out_target_view": _spark_tensor_trace_view_payload(
+                                    out_prefill_target
+                                ),
+                                "out_arg_view": _spark_tensor_trace_view_payload(
                                     out_prefill
                                 ),
                             },
@@ -2172,6 +2192,7 @@ class FlashInferImpl(AttentionImpl):
                                 "is_kvcache_nvfp4": bool(self.is_kvcache_nvfp4),
                                 "use_fa2_nvfp4_kv": bool(self.use_fa2_nvfp4_kv),
                                 "needs_fp8_out": bool(needs_fp8_out_prefill),
+                                "uses_contig_out": bool(uses_contig_out_prefill),
                                 "wrapper_type": type(prefill_wrapper).__name__,
                                 "window_left": int(self.window_left),
                                 "head_dim": int(self.head_size),
@@ -2184,6 +2205,12 @@ class FlashInferImpl(AttentionImpl):
                                 "out_after": spark_trace_last_token_summary(
                                     out_prefill
                                 ),
+                                "out_target_view": _spark_tensor_trace_view_payload(
+                                    out_prefill_target
+                                ),
+                                "out_arg_view": _spark_tensor_trace_view_payload(
+                                    out_prefill
+                                ),
                             },
                         )
 
@@ -2191,6 +2218,8 @@ class FlashInferImpl(AttentionImpl):
                         output[
                             num_decode_tokens : num_decode_tokens + num_prefill_tokens
                         ].copy_(out_prefill.to(output.dtype))
+                    elif uses_contig_out_prefill:
+                        out_prefill_target.copy_(out_prefill)
             else:
                 assert isinstance(attn_metadata.prefill, TRTLLMPrefill)
                 # prefill_query may be non-contiguous or have degenerate strides
