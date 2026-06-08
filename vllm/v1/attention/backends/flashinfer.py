@@ -44,6 +44,11 @@ from vllm.utils.flashinfer import (
 )
 from vllm.utils.math_utils import cdiv
 from vllm.utils.platform_utils import is_pin_memory_available
+from vllm.utils.spark_tensor_trace import (
+    spark_tensor_trace,
+    spark_tensor_trace_should_emit,
+    spark_trace_last_token_summary,
+)
 from vllm.utils.torch_utils import (
     canonicalize_singleton_dim_strides,
     is_quantized_kv_cache,
@@ -1737,6 +1742,7 @@ class FlashInferImpl(AttentionImpl):
         # performance to make sure it does not introduce any overhead.
 
         num_actual_tokens = attn_metadata.num_actual_tokens
+        layer_name = _spark_kv_trace_layer_name(layer)
 
         # FlashInfer treats uint8 KV cache as NVFP4. vLLM stores FP8 KV cache
         # as uint8 bytes, so pass FP8 caches with their logical dtype.
@@ -1793,7 +1799,6 @@ class FlashInferImpl(AttentionImpl):
             nvfp4_kv_data, nvfp4_kv_block_scales = nvfp4_kv_cache_split_views(
                 kv_cache_permute
             )
-            layer_name = _spark_kv_trace_layer_name(layer)
             if _spark_kv_trace_should_emit(
                 "kv_read_views_nvfp4", layer_name=layer_name
             ):
@@ -1831,6 +1836,28 @@ class FlashInferImpl(AttentionImpl):
                         "num_kv_heads": int(self.num_kv_heads),
                     },
                 )
+        if spark_tensor_trace_should_emit("flashinfer_attn_input", layer_name):
+            spark_tensor_trace(
+                "flashinfer_attn_input",
+                {
+                    "layer_name": layer_name,
+                    "kv_cache_dtype": str(self.kv_cache_dtype),
+                    "is_kvcache_nvfp4": bool(self.is_kvcache_nvfp4),
+                    "use_fa2_nvfp4_kv": bool(self.use_fa2_nvfp4_kv),
+                    "window_left": int(self.window_left),
+                    "head_dim": int(self.head_size),
+                    "num_q_heads": int(self.num_heads),
+                    "num_kv_heads": int(self.num_kv_heads),
+                    "num_actual_tokens": int(num_actual_tokens),
+                    "num_decodes": int(attn_metadata.num_decodes),
+                    "num_decode_tokens": int(num_decode_tokens),
+                    "num_prefills": int(attn_metadata.num_prefills),
+                    "num_prefill_tokens": int(num_prefill_tokens),
+                    "query_last": spark_trace_last_token_summary(query),
+                    "key_last": spark_trace_last_token_summary(key),
+                    "value_last": spark_trace_last_token_summary(value),
+                },
+            )
 
         use_dcp = self.dcp_world_size > 1
 
@@ -2153,6 +2180,26 @@ class FlashInferImpl(AttentionImpl):
 
                 if needs_fp8_out:
                     output[:num_decode_tokens].copy_(out.to(output.dtype))
+        if spark_tensor_trace_should_emit("flashinfer_attn_output", layer_name):
+            spark_tensor_trace(
+                "flashinfer_attn_output",
+                {
+                    "layer_name": layer_name,
+                    "kv_cache_dtype": str(self.kv_cache_dtype),
+                    "is_kvcache_nvfp4": bool(self.is_kvcache_nvfp4),
+                    "use_fa2_nvfp4_kv": bool(self.use_fa2_nvfp4_kv),
+                    "window_left": int(self.window_left),
+                    "head_dim": int(self.head_size),
+                    "num_q_heads": int(self.num_heads),
+                    "num_kv_heads": int(self.num_kv_heads),
+                    "num_actual_tokens": int(num_actual_tokens),
+                    "num_decodes": int(attn_metadata.num_decodes),
+                    "num_decode_tokens": int(num_decode_tokens),
+                    "num_prefills": int(attn_metadata.num_prefills),
+                    "num_prefill_tokens": int(num_prefill_tokens),
+                    "output_last": spark_trace_last_token_summary(output),
+                },
+            )
         return output_padded
 
     def do_kv_cache_update(
