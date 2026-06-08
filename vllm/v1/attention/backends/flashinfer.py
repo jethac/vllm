@@ -4,6 +4,7 @@
 
 from dataclasses import dataclass
 from functools import partial
+import json
 import os
 from typing import ClassVar
 
@@ -86,6 +87,187 @@ FP4_DTYPE = torch.uint8
 logger = init_logger(__name__)
 
 trtllm_gen_workspace_buffer = None
+_SPARK_KV_TRACE_COUNTS: dict[tuple[str, str], int] = {}
+
+
+def _spark_kv_trace_enabled() -> bool:
+    return os.environ.get("VLLM_SPARK_KV_TRACE") == "1"
+
+
+def _spark_kv_trace_int(name: str, default: int) -> int:
+    try:
+        return max(0, int(os.environ.get(name, str(default))))
+    except ValueError:
+        return default
+
+
+def _spark_kv_trace_layer_name(layer: torch.nn.Module | None) -> str | None:
+    if layer is None:
+        return None
+    name = getattr(layer, "layer_name", None)
+    return str(name) if name is not None else None
+
+
+def _spark_kv_trace_wants_layer(
+    layer_name: str | None = None,
+    layer_names: list[str] | None = None,
+) -> bool:
+    raw_filter = os.environ.get("VLLM_SPARK_KV_TRACE_LAYERS", "")
+    filters = [item.strip() for item in raw_filter.split(",") if item.strip()]
+    if not filters:
+        return True
+    candidates = []
+    if layer_name is not None:
+        candidates.append(layer_name)
+    if layer_names is not None:
+        candidates.extend(layer_names)
+    return any(f in candidate for f in filters for candidate in candidates)
+
+
+def _spark_kv_trace_should_emit(
+    event: str,
+    layer_name: str | None = None,
+    layer_names: list[str] | None = None,
+) -> bool:
+    if not _spark_kv_trace_enabled():
+        return False
+    if not _spark_kv_trace_wants_layer(layer_name, layer_names):
+        return False
+    limit = _spark_kv_trace_int("VLLM_SPARK_KV_TRACE_LIMIT", 4)
+    if limit == 0:
+        return False
+    layer_key = layer_name or ",".join(layer_names or ["<none>"])
+    key = (event, layer_key)
+    count = _SPARK_KV_TRACE_COUNTS.get(key, 0)
+    if count >= limit:
+        return False
+    _SPARK_KV_TRACE_COUNTS[key] = count + 1
+    return True
+
+
+def _spark_kv_trace_tensor_head(
+    tensor: torch.Tensor | None,
+    limit: int | None = None,
+) -> list[int | float | bool | str] | None:
+    if tensor is None:
+        return None
+    if limit is None:
+        limit = _spark_kv_trace_int("VLLM_SPARK_KV_TRACE_LIMIT", 4)
+    if limit <= 0:
+        return []
+    tensor = tensor.detach()
+    if tensor.numel() == 0:
+        return []
+    try:
+        values: list[int | float | bool | str] = []
+        shape = tuple(tensor.shape)
+        for linear_idx in range(min(limit, tensor.numel())):
+            if len(shape) == 0:
+                index = ()
+            else:
+                index_parts = []
+                remainder = linear_idx
+                for size in reversed(shape):
+                    index_parts.append(remainder % size)
+                    remainder //= size
+                index = tuple(reversed(index_parts))
+            value = tensor[index].cpu().item()
+            values.append(value)
+        return values
+    except Exception as exc:
+        return [f"<read_error:{type(exc).__name__}>"]
+
+
+def _spark_kv_trace_view_info(tensor: torch.Tensor | None) -> dict[str, object] | None:
+    if tensor is None:
+        return None
+    return {
+        "shape": list(tensor.shape),
+        "stride": list(tensor.stride()),
+        "storage_offset": int(tensor.storage_offset()),
+        "dtype": str(tensor.dtype),
+    }
+
+
+def _spark_kv_trace_views_info(
+    views: tuple[torch.Tensor, ...] | None,
+) -> list[dict[str, object] | None] | None:
+    if views is None:
+        return None
+    return [_spark_kv_trace_view_info(view) for view in views]
+
+
+def _spark_kv_trace_slot_samples(
+    data_views: tuple[torch.Tensor, ...] | None,
+    scale_views: tuple[torch.Tensor, ...] | None,
+    slot_mapping: torch.Tensor | None,
+    page_size: int,
+) -> list[dict[str, object]]:
+    if data_views is None or scale_views is None or slot_mapping is None:
+        return []
+    num_slots = _spark_kv_trace_int("VLLM_SPARK_KV_TRACE_LIMIT", 4)
+    num_values = _spark_kv_trace_int("VLLM_SPARK_KV_TRACE_VALUES", 8)
+    if num_slots <= 0 or num_values <= 0:
+        return []
+    slots = _spark_kv_trace_tensor_head(slot_mapping, num_slots) or []
+    samples: list[dict[str, object]] = []
+    for raw_slot in slots:
+        try:
+            slot = int(raw_slot)
+            page = slot // page_size
+            offset = slot % page_size
+            sample: dict[str, object] = {
+                "slot": slot,
+                "page": page,
+                "offset": offset,
+            }
+            for prefix, views in (("data", data_views), ("scale", scale_views)):
+                for side, view in zip(("k", "v"), views):
+                    row = view[page, offset, 0]
+                    if prefix == "scale":
+                        row = row.view(torch.uint8)
+                    sample[f"{side}_{prefix}_head"] = _spark_kv_trace_tensor_head(
+                        row, num_values
+                    )
+            samples.append(sample)
+        except Exception as exc:
+            samples.append(
+                {
+                    "slot": raw_slot,
+                    "error": type(exc).__name__,
+                }
+            )
+    return samples
+
+
+def _spark_kv_trace(event: str, payload: dict[str, object]) -> None:
+    if not _spark_kv_trace_enabled():
+        return
+    record = {
+        "event": event,
+        "pid": os.getpid(),
+        **payload,
+    }
+    try:
+        line = json.dumps(record, sort_keys=True, default=str)
+    except Exception as exc:
+        line = json.dumps(
+            {
+                "event": event,
+                "pid": os.getpid(),
+                "json_error": type(exc).__name__,
+            },
+            sort_keys=True,
+        )
+    path = os.environ.get("VLLM_SPARK_KV_TRACE_FILE")
+    if path:
+        try:
+            with open(path, "a", encoding="utf-8") as trace_file:
+                trace_file.write(line + "\n")
+            return
+        except OSError as exc:
+            logger.warning("Failed to write Spark KV trace %s: %s", path, exc)
+    logger.warning("Spark KV trace: %s", line)
 
 
 def _ensure_vllm_nvfp4_kv_deswizzle_flag() -> None:
@@ -1085,6 +1267,47 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         else:
             paged_kv_indices = None
 
+        if _spark_kv_trace_should_emit(
+            "fi_metadata", layer_names=self.layer_names
+        ):
+            limit = _spark_kv_trace_int("VLLM_SPARK_KV_TRACE_LIMIT", 4)
+            _spark_kv_trace(
+                "fi_metadata",
+                {
+                    "layer_names": self.layer_names,
+                    "cache_dtype": str(self.cache_dtype),
+                    "kv_cache_dtype": str(self.kv_cache_dtype),
+                    "page_size": int(page_size),
+                    "head_dim": int(self.head_dim),
+                    "num_q_heads": int(self.num_qo_heads),
+                    "num_kv_heads": int(self.num_kv_heads),
+                    "window_left": int(self.window_left),
+                    "num_reqs": int(num_reqs),
+                    "num_actual_tokens": int(num_actual_tokens),
+                    "num_decodes": int(num_decodes),
+                    "num_decode_tokens": int(num_decode_tokens),
+                    "num_prefills": int(num_prefills),
+                    "num_prefill_tokens": int(num_prefill_tokens),
+                    "slot_mapping_head": _spark_kv_trace_tensor_head(
+                        common_attn_metadata.slot_mapping, limit
+                    ),
+                    "block_table_head": _spark_kv_trace_tensor_head(
+                        block_table_tensor, limit
+                    ),
+                    "paged_kv_indptr_head": _spark_kv_trace_tensor_head(
+                        self.paged_kv_indptr.cpu[: num_reqs + 1], limit
+                    ),
+                    "paged_kv_indices_head": _spark_kv_trace_tensor_head(
+                        paged_kv_indices, limit
+                    ),
+                    "paged_kv_last_page_len_head": _spark_kv_trace_tensor_head(
+                        self.paged_kv_last_page_len.cpu[:num_reqs], limit
+                    ),
+                    "prefill_use_trtllm": bool(prefill_use_trtllm),
+                    "decode_use_trtllm": bool(decode_use_trtllm),
+                },
+            )
+
         # Early-out for cascade attention
         if use_cascade:
             assert num_blocks_np is not None
@@ -1570,6 +1793,44 @@ class FlashInferImpl(AttentionImpl):
             nvfp4_kv_data, nvfp4_kv_block_scales = nvfp4_kv_cache_split_views(
                 kv_cache_permute
             )
+            layer_name = _spark_kv_trace_layer_name(layer)
+            if _spark_kv_trace_should_emit(
+                "kv_read_views_nvfp4", layer_name=layer_name
+            ):
+                page_size = int(kv_cache_permute.shape[2])
+                _spark_kv_trace(
+                    "kv_read_views_nvfp4",
+                    {
+                        "layer_name": layer_name,
+                        "kv_cache_dtype": str(self.kv_cache_dtype),
+                        "kv_cache_shape": list(kv_cache.shape),
+                        "kv_cache_stride": list(kv_cache.stride()),
+                        "kv_cache_permute_shape": list(kv_cache_permute.shape),
+                        "kv_cache_permute_stride": list(kv_cache_permute.stride()),
+                        "data_views": _spark_kv_trace_views_info(nvfp4_kv_data),
+                        "scale_views": _spark_kv_trace_views_info(
+                            nvfp4_kv_block_scales
+                        ),
+                        "slot_mapping_head": _spark_kv_trace_tensor_head(
+                            attn_metadata.slot_mapping
+                        ),
+                        "slot_samples": _spark_kv_trace_slot_samples(
+                            nvfp4_kv_data,
+                            nvfp4_kv_block_scales,
+                            attn_metadata.slot_mapping,
+                            page_size,
+                        ),
+                        "num_actual_tokens": int(num_actual_tokens),
+                        "num_decodes": int(attn_metadata.num_decodes),
+                        "num_decode_tokens": int(num_decode_tokens),
+                        "num_prefills": int(attn_metadata.num_prefills),
+                        "num_prefill_tokens": int(num_prefill_tokens),
+                        "window_left": int(self.window_left),
+                        "head_dim": int(self.head_size),
+                        "num_q_heads": int(self.num_heads),
+                        "num_kv_heads": int(self.num_kv_heads),
+                    },
+                )
 
         use_dcp = self.dcp_world_size > 1
 
@@ -1912,6 +2173,34 @@ class FlashInferImpl(AttentionImpl):
             # actual tokens.
             k_cache = kv_cache[:, 0]
             v_cache = kv_cache[:, 1]
+            layer_name = _spark_kv_trace_layer_name(layer)
+            if _spark_kv_trace_should_emit("kv_write_pre", layer_name=layer_name):
+                _spark_kv_trace(
+                    "kv_write_pre",
+                    {
+                        "layer_name": layer_name,
+                        "kv_cache_dtype": str(self.kv_cache_dtype),
+                        "key_shape": list(key.shape),
+                        "key_stride": list(key.stride()),
+                        "key_dtype": str(key.dtype),
+                        "value_shape": list(value.shape),
+                        "value_stride": list(value.stride()),
+                        "value_dtype": str(value.dtype),
+                        "kv_cache_shape": list(kv_cache.shape),
+                        "kv_cache_stride": list(kv_cache.stride()),
+                        "kv_cache_dtype_actual": str(kv_cache.dtype),
+                        "k_cache_shape": list(k_cache.shape),
+                        "k_cache_stride": list(k_cache.stride()),
+                        "v_cache_shape": list(v_cache.shape),
+                        "v_cache_stride": list(v_cache.stride()),
+                        "slot_mapping_shape": list(slot_mapping.shape),
+                        "slot_mapping_head": _spark_kv_trace_tensor_head(
+                            slot_mapping
+                        ),
+                        "head_dim": int(self.head_size),
+                        "num_kv_heads": int(self.num_kv_heads),
+                    },
+                )
             torch.ops._C_cache_ops.reshape_and_cache_flash(
                 key,
                 value,
@@ -1922,6 +2211,37 @@ class FlashInferImpl(AttentionImpl):
                 layer._k_scale,
                 layer._v_scale,
             )
+            if self.is_kvcache_nvfp4 and _spark_kv_trace_should_emit(
+                "kv_write_post_nvfp4", layer_name=layer_name
+            ):
+                stride_order = FlashInferBackend.get_kv_cache_stride_order()
+                kv_cache_permute = kv_cache.permute(*stride_order)
+                data_views, scale_views = nvfp4_kv_cache_split_views(kv_cache_permute)
+                page_size = int(kv_cache_permute.shape[2])
+                _spark_kv_trace(
+                    "kv_write_post_nvfp4",
+                    {
+                        "layer_name": layer_name,
+                        "kv_cache_dtype": str(self.kv_cache_dtype),
+                        "kv_cache_shape": list(kv_cache.shape),
+                        "kv_cache_stride": list(kv_cache.stride()),
+                        "kv_cache_permute_shape": list(kv_cache_permute.shape),
+                        "kv_cache_permute_stride": list(kv_cache_permute.stride()),
+                        "data_views": _spark_kv_trace_views_info(data_views),
+                        "scale_views": _spark_kv_trace_views_info(scale_views),
+                        "slot_mapping_head": _spark_kv_trace_tensor_head(
+                            slot_mapping
+                        ),
+                        "slot_samples": _spark_kv_trace_slot_samples(
+                            data_views,
+                            scale_views,
+                            slot_mapping,
+                            page_size,
+                        ),
+                        "head_dim": int(self.head_size),
+                        "num_kv_heads": int(self.num_kv_heads),
+                    },
+                )
 
 
 def fast_plan_decode(

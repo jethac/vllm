@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import json
+import os
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
 
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
@@ -27,6 +30,75 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
+
+logger = init_logger(__name__)
+_SPARK_KV_TRACE_COUNTS: dict[tuple[str, str], int] = {}
+
+
+def _spark_kv_trace_enabled() -> bool:
+    return os.environ.get("VLLM_SPARK_KV_TRACE") == "1"
+
+
+def _spark_kv_trace_int(name: str, default: int) -> int:
+    try:
+        return max(0, int(os.environ.get(name, str(default))))
+    except ValueError:
+        return default
+
+
+def _spark_kv_trace_should_emit(event: str, key: str) -> bool:
+    if not _spark_kv_trace_enabled():
+        return False
+    limit = _spark_kv_trace_int("VLLM_SPARK_KV_TRACE_LIMIT", 4)
+    if limit == 0:
+        return False
+    count_key = (event, key)
+    count = _SPARK_KV_TRACE_COUNTS.get(count_key, 0)
+    if count >= limit:
+        return False
+    _SPARK_KV_TRACE_COUNTS[count_key] = count + 1
+    return True
+
+
+def _spark_kv_trace(event: str, payload: dict[str, object]) -> None:
+    if not _spark_kv_trace_enabled():
+        return
+    record = {
+        "event": event,
+        "pid": os.getpid(),
+        **payload,
+    }
+    try:
+        line = json.dumps(record, sort_keys=True, default=str)
+    except Exception as exc:
+        line = json.dumps(
+            {
+                "event": event,
+                "pid": os.getpid(),
+                "json_error": type(exc).__name__,
+            },
+            sort_keys=True,
+        )
+    path = os.environ.get("VLLM_SPARK_KV_TRACE_FILE")
+    if path:
+        try:
+            with open(path, "a", encoding="utf-8") as trace_file:
+                trace_file.write(line + "\n")
+            return
+        except OSError as exc:
+            logger.warning("Failed to write Spark KV trace %s: %s", path, exc)
+    logger.warning("Spark KV trace: %s", line)
+
+
+def _spark_kv_trace_block_ids(blocks: Sequence[KVCacheBlock]) -> list[int | str]:
+    limit = _spark_kv_trace_int("VLLM_SPARK_KV_TRACE_LIMIT", 4)
+    ids: list[int | str] = []
+    for block in itertools.islice(blocks, limit):
+        if block.is_null:
+            ids.append("null")
+        else:
+            ids.append(int(block.block_id))
+    return ids
 
 
 class SingleTypeKVCacheManager(ABC):
@@ -764,6 +836,37 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
             self.block_pool.free_blocks(uncached_blocks, prepend=True)
         self.num_cached_block.pop(request_id, None)
 
+    def remove_skipped_blocks(
+        self, request_id: str, total_computed_tokens: int
+    ) -> None:
+        if _spark_kv_trace_should_emit(
+            "swa_skip", f"remove:{self.kv_cache_group_id}:{request_id}"
+        ):
+            num_skipped_tokens = self.get_num_skipped_tokens(total_computed_tokens)
+            blocks = self.req_to_blocks.get(request_id, [])
+            num_skipped_blocks = min(
+                num_skipped_tokens // self.block_size,
+                len(blocks),
+            )
+            _spark_kv_trace(
+                "swa_skip",
+                {
+                    "source": "remove_skipped_blocks",
+                    "request_id": request_id,
+                    "kv_cache_group_id": int(self.kv_cache_group_id),
+                    "num_computed_tokens": int(total_computed_tokens),
+                    "sliding_window": int(self.sliding_window),
+                    "block_size": int(self.block_size),
+                    "num_skipped_tokens": int(num_skipped_tokens),
+                    "num_skipped_blocks": int(num_skipped_blocks),
+                    "num_request_blocks": int(len(blocks)),
+                    "skipped_block_ids_head": _spark_kv_trace_block_ids(
+                        blocks[:num_skipped_blocks]
+                    ),
+                },
+            )
+        super().remove_skipped_blocks(request_id, total_computed_tokens)
+
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """
         Get the number of tokens that will be skipped for attention computation.
@@ -790,7 +893,25 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         Returns:
             The number of tokens that will be skipped for attention computation.
         """
-        return max(0, num_computed_tokens - self.sliding_window + 1)
+        num_skipped_tokens = max(0, num_computed_tokens - self.sliding_window + 1)
+        if _spark_kv_trace_should_emit(
+            "swa_skip", f"calc:{self.kv_cache_group_id}"
+        ):
+            _spark_kv_trace(
+                "swa_skip",
+                {
+                    "source": "get_num_skipped_tokens",
+                    "kv_cache_group_id": int(self.kv_cache_group_id),
+                    "num_computed_tokens": int(num_computed_tokens),
+                    "sliding_window": int(self.sliding_window),
+                    "block_size": int(self.block_size),
+                    "num_skipped_tokens": int(num_skipped_tokens),
+                    "num_skipped_blocks": int(
+                        num_skipped_tokens // self.block_size
+                    ),
+                },
+            )
+        return num_skipped_tokens
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         """
