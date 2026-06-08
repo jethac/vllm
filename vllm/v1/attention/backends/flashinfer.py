@@ -104,6 +104,10 @@ def _spark_nvfp4_prefill_contig_out_enabled() -> bool:
     return os.environ.get("VLLM_SPARK_NVFP4_PREFILL_CONTIG_OUT") == "1"
 
 
+def _spark_nvfp4_prefill_fresh_wrapper_replay_enabled() -> bool:
+    return os.environ.get("VLLM_SPARK_NVFP4_PREFILL_FRESH_WRAPPER_REPLAY") == "1"
+
+
 def _spark_kv_trace_int(name: str, default: int) -> int:
     try:
         return max(0, int(os.environ.get(name, str(default))))
@@ -244,6 +248,52 @@ def _spark_tensor_trace_tuple_payload(
     if isinstance(tensors, tuple):
         return [_spark_tensor_trace_view_payload(tensor) for tensor in tensors]
     return _spark_tensor_trace_view_payload(tensors)
+
+
+def _spark_tensor_trace_compare_payload(
+    lhs: torch.Tensor | None,
+    rhs: torch.Tensor | None,
+) -> dict[str, object] | None:
+    if lhs is None or rhs is None:
+        return None
+    if lhs.shape != rhs.shape:
+        return {
+            "lhs_shape": list(lhs.shape),
+            "rhs_shape": list(rhs.shape),
+            "shape_mismatch": True,
+        }
+    try:
+        lhs_f = lhs.detach().float().reshape(-1)
+        rhs_f = rhs.detach().float().reshape(-1)
+        diff = lhs_f - rhs_f
+        finite = torch.isfinite(lhs_f) & torch.isfinite(rhs_f)
+        payload: dict[str, object] = {
+            "shape": list(lhs.shape),
+            "finite": int(finite.sum().cpu().item()),
+        }
+        if bool(finite.any().cpu().item()):
+            diff_f = diff[finite]
+            payload.update(
+                {
+                    "max_abs_diff": float(diff_f.abs().max().cpu().item()),
+                    "mean_abs_diff": float(diff_f.abs().mean().cpu().item()),
+                    "rms_diff": float(
+                        torch.sqrt(torch.mean(diff_f * diff_f)).cpu().item()
+                    ),
+                }
+            )
+            lhs_norm = torch.linalg.vector_norm(lhs_f[finite])
+            rhs_norm = torch.linalg.vector_norm(rhs_f[finite])
+            denom = lhs_norm * rhs_norm
+            if bool((denom > 0).cpu().item()):
+                payload["cosine"] = float(
+                    (torch.dot(lhs_f[finite], rhs_f[finite]) / denom)
+                    .cpu()
+                    .item()
+                )
+        return payload
+    except Exception as exc:
+        return {"compare_error": type(exc).__name__}
 
 
 def _spark_active_page_dump_enabled() -> bool:
@@ -1635,6 +1685,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         fixed_split_size=self.prefill_fixed_split_size,
                         disable_split_kv=self.disable_split_kv,
                     )
+                    prefill_wrapper.vllm_prefill_fixed_split_size = (
+                        self.prefill_fixed_split_size
+                    )
+                    prefill_wrapper.vllm_disable_split_kv = self.disable_split_kv
                 attn_metadata.prefill = FIPrefill(wrapper=prefill_wrapper)
 
         ## DECODE PATHWAY
@@ -1818,6 +1872,149 @@ class FlashInferImpl(AttentionImpl):
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         if self.sinks is not None and self.sinks.dtype != torch.float32:
             self.sinks = self.sinks.to(torch.float32)
+
+    def _spark_nvfp4_prefill_fresh_wrapper_replay(
+        self,
+        *,
+        layer: torch.nn.Module,
+        layer_name: str | None,
+        live_wrapper: BatchPrefillWithPagedKVCacheWrapper,
+        prefill_query: torch.Tensor,
+        kv_cache_permute: tuple[torch.Tensor, ...],
+        kv_cache_sf: tuple[torch.Tensor, ...] | None,
+        live_out: torch.Tensor,
+    ) -> None:
+        if (
+            not self.is_kvcache_nvfp4
+            or not self.use_fa2_nvfp4_kv
+            or not _spark_nvfp4_prefill_fresh_wrapper_replay_enabled()
+        ):
+            return
+        if not spark_tensor_trace_should_emit(
+            "flashinfer_wrapper_prefill_fresh_replay", layer_name
+        ):
+            return
+
+        payload: dict[str, object] = {
+            "layer_name": layer_name,
+            "kv_cache_dtype": str(self.kv_cache_dtype),
+            "window_left": int(self.window_left),
+            "head_dim": int(self.head_size),
+            "num_q_heads": int(self.num_heads),
+            "num_kv_heads": int(self.num_kv_heads),
+            "live_wrapper_type": type(live_wrapper).__name__,
+            "live_out": spark_trace_last_token_summary(live_out),
+        }
+        try:
+            qo_indptr = getattr(live_wrapper, "_qo_indptr_buf", None)
+            paged_kv_indptr = getattr(live_wrapper, "_paged_kv_indptr_buf", None)
+            paged_kv_indices = getattr(live_wrapper, "_paged_kv_indices_buf", None)
+            paged_kv_last_page_len = getattr(
+                live_wrapper, "_paged_kv_last_page_len_buf", None
+            )
+            if (
+                qo_indptr is None
+                or paged_kv_indptr is None
+                or paged_kv_indices is None
+                or paged_kv_last_page_len is None
+            ):
+                payload["replay_error"] = "missing_wrapper_plan_buffers"
+                spark_tensor_trace("flashinfer_wrapper_prefill_fresh_replay", payload)
+                return
+
+            batch_size = int(getattr(live_wrapper, "_batch_size", len(qo_indptr) - 1))
+            if batch_size <= 0:
+                payload["replay_error"] = "empty_batch"
+                spark_tensor_trace("flashinfer_wrapper_prefill_fresh_replay", payload)
+                return
+
+            num_pages = int(paged_kv_indptr[batch_size].detach().cpu().item())
+            qo_indptr = qo_indptr[: batch_size + 1]
+            paged_kv_indptr = paged_kv_indptr[: batch_size + 1]
+            paged_kv_indices = paged_kv_indices[:num_pages]
+            paged_kv_last_page_len = paged_kv_last_page_len[:batch_size]
+
+            workspace_mb = _spark_kv_trace_int(
+                "VLLM_SPARK_NVFP4_FRESH_WRAPPER_WORKSPACE_MB", 256
+            )
+            workspace_bytes = max(1, workspace_mb) * 1024 * 1024
+            workspace = torch.empty(
+                (workspace_bytes,), dtype=torch.uint8, device=prefill_query.device
+            )
+            fresh_wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                workspace,
+                get_kv_cache_layout(),
+                backend="fa2",
+            )
+
+            live_fixed_split_size = int(
+                getattr(live_wrapper, "vllm_prefill_fixed_split_size", -1)
+            )
+            live_disable_split_kv = bool(
+                getattr(live_wrapper, "vllm_disable_split_kv", False)
+            )
+            fresh_wrapper.plan(
+                qo_indptr=qo_indptr,
+                paged_kv_indptr=paged_kv_indptr,
+                paged_kv_indices=paged_kv_indices,
+                paged_kv_last_page_len=paged_kv_last_page_len,
+                num_qo_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim_qk=self.head_size,
+                page_size=kv_cache_permute[0].shape[
+                    2 if get_kv_cache_layout() == "HND" else 1
+                ],
+                causal=True,
+                sm_scale=self.scale,
+                window_left=self.window_left,
+                logits_soft_cap=self.logits_soft_cap,
+                q_data_type=prefill_query.dtype,
+                kv_data_type=self.kv_cache_dtype,
+                o_data_type=prefill_query.dtype,
+                fixed_split_size=live_fixed_split_size,
+                disable_split_kv=live_disable_split_kv,
+            )
+            fresh_out = torch.empty_like(prefill_query)
+            fresh_wrapper.run(
+                prefill_query,
+                kv_cache_permute,
+                k_scale=layer._k_scale_float,
+                v_scale=layer._v_scale_float,
+                out=fresh_out,
+                kv_cache_sf=kv_cache_sf,
+            )
+            payload.update(
+                {
+                    "batch_size": batch_size,
+                    "num_pages": num_pages,
+                    "workspace_mb": workspace_mb,
+                    "fixed_split_size": live_fixed_split_size,
+                    "disable_split_kv": live_disable_split_kv,
+                    "fresh_out": spark_trace_last_token_summary(fresh_out),
+                    "fresh_vs_live": _spark_tensor_trace_compare_payload(
+                        fresh_out, live_out
+                    ),
+                    "fresh_wrapper_backend": getattr(
+                        fresh_wrapper, "_backend", "<unknown>"
+                    ),
+                    "fresh_cached_module": type(
+                        getattr(fresh_wrapper, "_cached_module", None)
+                    ).__name__,
+                    "live_wrapper_backend": getattr(
+                        live_wrapper, "_backend", "<unknown>"
+                    ),
+                    "live_cached_module": type(
+                        getattr(live_wrapper, "_cached_module", None)
+                    ).__name__,
+                }
+            )
+        except Exception as exc:
+            payload["replay_error"] = type(exc).__name__
+            payload["replay_error_message"] = str(exc)
+            logger.exception(
+                "Failed Spark fresh FlashInfer prefill replay for %s", layer_name
+            )
+        spark_tensor_trace("flashinfer_wrapper_prefill_fresh_replay", payload)
 
     def forward(
         self,
@@ -2156,6 +2353,24 @@ class FlashInferImpl(AttentionImpl):
                         out=out_prefill,
                         kv_cache_sf=kv_cache_sf,
                     )
+
+                    if (
+                        self.is_kvcache_nvfp4
+                        and self.use_fa2_nvfp4_kv
+                        and isinstance(prefill_wrapper, BatchPrefillWithPagedKVCacheWrapper)
+                        and isinstance(kv_cache_permute, tuple)
+                    ):
+                        self._spark_nvfp4_prefill_fresh_wrapper_replay(
+                            layer=layer,
+                            layer_name=layer_name,
+                            live_wrapper=prefill_wrapper,
+                            prefill_query=prefill_query,
+                            kv_cache_permute=kv_cache_permute,
+                            kv_cache_sf=kv_cache_sf
+                            if isinstance(kv_cache_sf, tuple)
+                            else None,
+                            live_out=out_prefill,
+                        )
 
                     if (
                         dump_out_before is not None
