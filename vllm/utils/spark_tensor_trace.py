@@ -34,6 +34,8 @@ def spark_tensor_trace_wants_layer(layer_name: str | None) -> bool:
 def spark_tensor_trace_should_emit(event: str, layer_name: str | None) -> bool:
     if not spark_tensor_trace_enabled():
         return False
+    if torch.compiler.is_compiling():
+        return False
     if not spark_tensor_trace_wants_layer(layer_name):
         return False
     limit = _spark_tensor_trace_int("VLLM_SPARK_GEMMA_TENSOR_TRACE_LIMIT", 4)
