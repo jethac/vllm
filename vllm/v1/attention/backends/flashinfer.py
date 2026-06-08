@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from functools import partial
 import json
 import os
+import sys
 from typing import ClassVar
 
 import numpy as np
@@ -195,12 +196,19 @@ def _spark_kv_trace_tensor_head(
 def _spark_kv_trace_view_info(tensor: torch.Tensor | None) -> dict[str, object] | None:
     if tensor is None:
         return None
-    return {
+    payload: dict[str, object] = {
         "shape": list(tensor.shape),
         "stride": list(tensor.stride()),
         "storage_offset": int(tensor.storage_offset()),
         "dtype": str(tensor.dtype),
+        "device": str(tensor.device),
     }
+    try:
+        payload["data_ptr"] = int(tensor.data_ptr())
+        payload["storage_data_ptr"] = int(tensor.untyped_storage().data_ptr())
+    except Exception as exc:
+        payload["ptr_error"] = type(exc).__name__
+    return payload
 
 
 def _spark_kv_trace_views_info(
@@ -294,6 +302,106 @@ def _spark_tensor_trace_compare_payload(
         return payload
     except Exception as exc:
         return {"compare_error": type(exc).__name__}
+
+
+def _spark_safe_repr(value: object, limit: int = 240) -> str | None:
+    if value is None:
+        return None
+    try:
+        text = repr(value)
+    except Exception as exc:
+        text = f"<repr_error:{type(exc).__name__}>"
+    if len(text) > limit:
+        return text[:limit] + "..."
+    return text
+
+
+def _spark_trace_tensor_buffer_payload(
+    tensor: torch.Tensor | None,
+) -> dict[str, object] | None:
+    if tensor is None:
+        return None
+    flat = tensor.detach().reshape(-1)
+    values = _spark_kv_trace_int("VLLM_SPARK_GEMMA_TENSOR_TRACE_VALUES", 16)
+    payload = _spark_tensor_trace_view_payload(tensor) or {}
+    if values > 0 and flat.numel() > values:
+        try:
+            payload["tail"] = _spark_kv_trace_tensor_head(flat[-values:], values)
+        except Exception as exc:
+            payload["tail_error"] = type(exc).__name__
+    return payload
+
+
+def _spark_trace_module_payload(module: object) -> dict[str, object] | None:
+    if module is None:
+        return None
+    return {
+        "type": type(module).__name__,
+        "name": getattr(module, "__name__", None),
+        "file": getattr(module, "__file__", None),
+        "repr": _spark_safe_repr(module),
+        "has_plan": hasattr(module, "plan"),
+        "has_paged_run": hasattr(module, "paged_run"),
+        "has_ragged_run": hasattr(module, "ragged_run"),
+    }
+
+
+def _spark_trace_prefill_wrapper_payload(
+    wrapper: BatchPrefillWithPagedKVCacheWrapper,
+) -> dict[str, object]:
+    flashinfer_module = sys.modules.get("flashinfer")
+    flashinfer_prefill_module = sys.modules.get("flashinfer.prefill")
+    return {
+        "wrapper_type": type(wrapper).__name__,
+        "flashinfer_file": getattr(flashinfer_module, "__file__", None),
+        "flashinfer_prefill_file": getattr(
+            flashinfer_prefill_module, "__file__", None
+        ),
+        "flashinfer_extra_cudaflags": os.environ.get(
+            "FLASHINFER_EXTRA_CUDAFLAGS", ""
+        ),
+        "backend": getattr(wrapper, "_backend", None),
+        "kv_layout": getattr(wrapper, "_kv_layout", None),
+        "use_cuda_graph": bool(getattr(wrapper, "_use_cuda_graph", False)),
+        "causal": bool(getattr(wrapper, "_causal", False)),
+        "window_left": int(getattr(wrapper, "_window_left", -9999)),
+        "logits_soft_cap": _spark_trace_scalar(
+            getattr(wrapper, "_logits_soft_cap", None)
+        ),
+        "sm_scale": _spark_trace_scalar(getattr(wrapper, "_sm_scale", None)),
+        "batch_size": int(getattr(wrapper, "_batch_size", -1)),
+        "num_qo_heads": int(getattr(wrapper, "_num_qo_heads", -1)),
+        "num_kv_heads": int(getattr(wrapper, "_num_kv_heads", -1)),
+        "qo_indptr_last": int(getattr(wrapper, "_qo_indptr_last", -1)),
+        "max_q_len": int(getattr(wrapper, "_max_q_len", -1)),
+        "max_kv_len": int(getattr(wrapper, "_max_kv_len", -1)),
+        "workspace_size": int(getattr(wrapper, "_workspace_size", -1)),
+        "cached_q_data_type": str(getattr(wrapper, "_cached_q_data_type", None)),
+        "cached_kv_data_type": str(getattr(wrapper, "_cached_kv_data_type", None)),
+        "cached_o_data_type": str(getattr(wrapper, "_cached_o_data_type", None)),
+        "fixed_split_size": int(
+            getattr(wrapper, "vllm_prefill_fixed_split_size", -9999)
+        ),
+        "disable_split_kv": bool(getattr(wrapper, "vllm_disable_split_kv", False)),
+        "plan_info_type": type(getattr(wrapper, "_plan_info", None)).__name__,
+        "plan_info_repr": _spark_safe_repr(getattr(wrapper, "_plan_info", None)),
+        "cached_module": _spark_trace_module_payload(
+            getattr(wrapper, "_cached_module", None)
+        ),
+        "jit_module": _spark_trace_module_payload(getattr(wrapper, "_jit_module", None)),
+        "qo_indptr": _spark_trace_tensor_buffer_payload(
+            getattr(wrapper, "_qo_indptr_buf", None)
+        ),
+        "paged_kv_indptr": _spark_trace_tensor_buffer_payload(
+            getattr(wrapper, "_paged_kv_indptr_buf", None)
+        ),
+        "paged_kv_indices": _spark_trace_tensor_buffer_payload(
+            getattr(wrapper, "_paged_kv_indices_buf", None)
+        ),
+        "paged_kv_last_page_len": _spark_trace_tensor_buffer_payload(
+            getattr(wrapper, "_paged_kv_last_page_len_buf", None)
+        ),
+    }
 
 
 def _spark_active_page_dump_enabled() -> bool:
@@ -2018,6 +2126,12 @@ class FlashInferImpl(AttentionImpl):
                     "live_cached_module": type(
                         getattr(live_wrapper, "_cached_module", None)
                     ).__name__,
+                    "fresh_wrapper_plan": _spark_trace_prefill_wrapper_payload(
+                        fresh_wrapper
+                    ),
+                    "live_wrapper_plan": _spark_trace_prefill_wrapper_payload(
+                        live_wrapper
+                    ),
                 }
             )
         except Exception as exc:
@@ -2365,6 +2479,48 @@ class FlashInferImpl(AttentionImpl):
                         out=out_prefill,
                         kv_cache_sf=kv_cache_sf,
                     )
+
+                    if (
+                        self.is_kvcache_nvfp4
+                        and self.use_fa2_nvfp4_kv
+                        and isinstance(prefill_wrapper, BatchPrefillWithPagedKVCacheWrapper)
+                        and spark_tensor_trace_should_emit(
+                            "flashinfer_wrapper_prefill_plan_run", layer_name
+                        )
+                    ):
+                        spark_tensor_trace(
+                            "flashinfer_wrapper_prefill_plan_run",
+                            {
+                                "layer_name": layer_name,
+                                "kv_cache_dtype": str(self.kv_cache_dtype),
+                                "window_left": int(self.window_left),
+                                "head_dim": int(self.head_size),
+                                "num_q_heads": int(self.num_heads),
+                                "num_kv_heads": int(self.num_kv_heads),
+                                "num_prefill_tokens": int(num_prefill_tokens),
+                                "num_decode_tokens": int(num_decode_tokens),
+                                "k_scale": _spark_trace_scalar(layer._k_scale_float),
+                                "v_scale": _spark_trace_scalar(layer._v_scale_float),
+                                "query": _spark_tensor_trace_view_payload(
+                                    prefill_query
+                                ),
+                                "kv_cache_arg": _spark_tensor_trace_tuple_payload(
+                                    kv_cache_permute
+                                ),
+                                "kv_cache_sf": _spark_tensor_trace_tuple_payload(
+                                    kv_cache_sf
+                                ),
+                                "out_arg": _spark_tensor_trace_view_payload(
+                                    out_prefill
+                                ),
+                                "wrapper_plan": _spark_trace_prefill_wrapper_payload(
+                                    prefill_wrapper
+                                ),
+                                "flashinfer_extra_cudaflags": os.environ.get(
+                                    "FLASHINFER_EXTRA_CUDAFLAGS", ""
+                                ),
+                            },
+                        )
 
                     if (
                         self.is_kvcache_nvfp4
