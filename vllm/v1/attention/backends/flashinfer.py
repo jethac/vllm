@@ -7,7 +7,7 @@ from functools import partial
 import json
 import os
 import sys
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import numpy as np
 import torch
@@ -609,6 +609,92 @@ def _ensure_vllm_nvfp4_kv_deswizzle_flag() -> None:
     os.environ["FLASHINFER_EXTRA_CUDAFLAGS"] = (
         f"{extra_flags} {VLLM_NVFP4_V_SF_DESWIZZLE_FLAG}".strip()
     )
+
+
+def _flashinfer_dtype_uri_part(dtype: torch.dtype) -> str:
+    return str(dtype).replace("torch.", "").replace(".", "_")
+
+
+def _fa2_nvfp4_prefill_jit_args(
+    *,
+    q_data_type: torch.dtype,
+    kv_data_type: torch.dtype,
+    o_data_type: torch.dtype,
+    idtype: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    use_sliding_window: bool,
+    use_logits_soft_cap: bool,
+    pos_encoding_mode: int = 0,
+    use_fp16_qk_reduction: bool = False,
+) -> tuple[list[Any], dict[str, Any]]:
+    """Build a FlashInfer FA2 paged-prefill JIT module that declares FP4 KV."""
+
+    uri = (
+        "vllm_batch_prefill_nvfp4_kv_"
+        f"dtype_q_{_flashinfer_dtype_uri_part(q_data_type)}_"
+        "dtype_kv_fp4x2_e2m1_"
+        f"dtype_o_{_flashinfer_dtype_uri_part(o_data_type)}_"
+        f"dtype_idx_{_flashinfer_dtype_uri_part(idtype)}_"
+        f"head_dim_qk_{head_dim_qk}_"
+        f"head_dim_vo_{head_dim_vo}_"
+        f"posenc_{pos_encoding_mode}_"
+        f"swa_{int(use_sliding_window)}_"
+        f"logits_cap_{int(use_logits_soft_cap)}_"
+        f"fp16_qk_{int(use_fp16_qk_reduction)}"
+    )
+    jit_args: list[Any] = [
+        uri,
+        q_data_type,
+        kv_data_type,
+        o_data_type,
+        idtype,
+        head_dim_qk,
+        head_dim_vo,
+        [
+            "maybe_custom_mask",
+            "maybe_mask_indptr",
+            "maybe_alibi_slopes",
+            "maybe_prefix_len_ptr",
+            "maybe_token_pos_in_items_ptr",
+            "maybe_max_item_len_ptr",
+            "maybe_k_cache_sf",
+            "maybe_v_cache_sf",
+        ],
+        [
+            "uint8_t",
+            "int32_t",
+            "float",
+            "uint32_t",
+            "uint16_t",
+            "uint16_t",
+            "uint8_t",
+            "uint8_t",
+        ],
+        [
+            "logits_soft_cap",
+            "sm_scale",
+            "rope_rcp_scale",
+            "rope_rcp_theta",
+            "token_pos_in_items_len",
+        ],
+        ["double", "double", "double", "double", "int64_t"],
+        (
+            "DefaultAttention<use_custom_mask, "
+            f"{str(use_sliding_window).lower()}, "
+            f"{str(use_logits_soft_cap).lower()}, "
+            f"{str(pos_encoding_mode == 2).lower()}>"
+        ),
+        "#include<flashinfer/attention/variants.cuh>",
+    ]
+    jit_kwargs = {
+        "pos_encoding_mode": pos_encoding_mode,
+        "use_sliding_window": use_sliding_window,
+        "use_logits_soft_cap": use_logits_soft_cap,
+        "use_fp16_qk_reduction": use_fp16_qk_reduction,
+        "fp8_enabled": False,
+    }
+    return jit_args, jit_kwargs
 
 
 def _get_trtllm_gen_workspace_buffer():
@@ -1326,14 +1412,31 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             else:
                 if self.use_fa2_nvfp4_kv:
                     backend = "fa2"
+                    o_dtype = self.model_config.dtype
+                    jit_args, jit_kwargs = _fa2_nvfp4_prefill_jit_args(
+                        q_data_type=self.q_data_type,
+                        kv_data_type=self.kv_cache_dtype,
+                        o_data_type=o_dtype,
+                        idtype=torch.int32,
+                        head_dim_qk=self.head_dim,
+                        head_dim_vo=self.head_dim,
+                        use_sliding_window=self.window_left >= 0,
+                        use_logits_soft_cap=(self.logits_soft_cap or 0.0) > 0,
+                    )
                 elif self.is_kvcache_nvfp4:
                     backend = "trtllm-gen"
+                    jit_args = None
+                    jit_kwargs = None
                 else:
                     backend = "auto"
+                    jit_args = None
+                    jit_kwargs = None
                 self._prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
                     self._get_workspace_buffer(),
                     get_kv_cache_layout(),
                     backend=backend,
+                    jit_args=jit_args,
+                    jit_kwargs=jit_kwargs,
                 )
         assert self._prefill_wrapper is not None
         return self._prefill_wrapper
@@ -2402,21 +2505,6 @@ class FlashInferImpl(AttentionImpl):
                     kv_cache_sf = (
                         nvfp4_kv_block_scales if self.is_kvcache_nvfp4 else None
                     )
-                    if (
-                        self.is_kvcache_nvfp4
-                        and self.use_fa2_nvfp4_kv
-                        and kv_cache_sf is not None
-                    ):
-                        jit_tensor_names = getattr(
-                            prefill_wrapper, "_jit_additional_tensor_names", None
-                        )
-                        if jit_tensor_names is not None:
-                            for tensor_name in (
-                                "maybe_k_cache_sf",
-                                "maybe_v_cache_sf",
-                            ):
-                                if tensor_name not in jit_tensor_names:
-                                    jit_tensor_names.append(tensor_name)
 
                     # SM100 TRTLLM NVFP4 only supports FP8 output. The SM12x
                     # FA2 path writes model dtype directly.
