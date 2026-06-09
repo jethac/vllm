@@ -92,6 +92,33 @@ class Gemma4Config(VerifyAndUpdateConfig):
             and max_head_dim > 256
             and vllm_config.attention_config.backend is None
         ):
+            cache_config = vllm_config.cache_config
+            mixed_kv_requested = (
+                cache_config is not None
+                and cache_config.cache_dtype != "auto"
+                and bool(cache_config.kv_cache_dtype_skip_layers)
+            )
+            if mixed_kv_requested:
+                # Per-layer mixed KV (e.g. NVFP4 on sliding-window layers
+                # with a "full_attention" fallback) needs per-layer backend
+                # resolution: the quantized local layers must keep a backend
+                # that can read their cache (FlashInfer for NVFP4 on SM12x),
+                # which a model-wide TRITON_ATTN force breaks outright.
+                # Backend selection is per layer (head_size + the layer's
+                # resolved kv_cache_dtype), so the >256 head-dim global
+                # layers fall back to a head-size-capable backend on their
+                # own. Mixed-backend output must pass the model's quality
+                # gates before any serving claim.
+                logger.info(
+                    "Gemma4 has heterogeneous head dimensions (head_dim=%d, "
+                    "global_head_dim=%d) and per-layer mixed KV dtypes are "
+                    "configured: keeping per-layer attention backend "
+                    "resolution instead of forcing TRITON_ATTN.",
+                    head_dim,
+                    global_head_dim,
+                )
+                return
+
             from vllm.v1.attention.backends.registry import (
                 AttentionBackendEnum,
             )
