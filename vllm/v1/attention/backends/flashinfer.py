@@ -2917,6 +2917,21 @@ class FlashInferImpl(AttentionImpl):
                     kv_cache_sf = (
                         nvfp4_kv_block_scales if self.is_kvcache_nvfp4 else None
                     )
+                    if (
+                        self.is_kvcache_nvfp4
+                        and self.use_fa2_nvfp4_kv
+                        and kv_cache_sf is not None
+                    ):
+                        jit_tensor_names = getattr(
+                            prefill_wrapper, "_jit_additional_tensor_names", None
+                        )
+                        if jit_tensor_names is not None:
+                            for tensor_name in (
+                                "maybe_k_cache_sf",
+                                "maybe_v_cache_sf",
+                            ):
+                                if tensor_name not in jit_tensor_names:
+                                    jit_tensor_names.append(tensor_name)
 
                     # SM100 TRTLLM NVFP4 only supports FP8 output. The SM12x
                     # FA2 path writes model dtype directly.
