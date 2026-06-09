@@ -260,6 +260,15 @@ class Attention(nn.Module, AttentionLayerBase):
                 and "sliding_window" in cache_config.kv_cache_dtype_skip_layers
             ):
                 skip = True
+            # Full/global-attention layers (no sliding window). Lets hybrid-SWA
+            # models keep quantized KV on the local layers while the global
+            # layers (e.g. Gemma 4 D=512, unsupported by the FP4 attention
+            # kernels) fall back to the model dtype.
+            if (
+                sliding_window is None
+                and "full_attention" in cache_config.kv_cache_dtype_skip_layers
+            ):
+                skip = True
             # Check layer index
             layer_idx = extract_layer_index(prefix)
             if str(layer_idx) in cache_config.kv_cache_dtype_skip_layers:
