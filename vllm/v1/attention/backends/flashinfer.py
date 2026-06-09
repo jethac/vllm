@@ -1227,9 +1227,16 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.page_size = self.kv_cache_spec.block_size
 
         if self.kv_cache_spec.kv_quant_mode != KVQuantMode.NONE:
-            self.cache_dtype = self.cache_config.cache_dtype
-            # Cannot use self.kv_cache_spec.dtype here because kv_cache_spec
-            # storage dtype may not be the same as the op dtype (uint8 vs fp8_e4m3)
+            # Prefer the dtype string the layer group resolved to: with
+            # per-layer mixed KV dtypes (kv_cache_dtype_skip_layers
+            # overrides) the global cache_config.cache_dtype no longer
+            # describes every group. Cannot use self.kv_cache_spec.dtype
+            # because kv_cache_spec storage dtype may not be the same as
+            # the op dtype (uint8 vs fp8_e4m3).
+            self.cache_dtype = (
+                getattr(self.kv_cache_spec, "cache_dtype_str", None)
+                or self.cache_config.cache_dtype
+            )
             self.is_kvcache_nvfp4 = self.cache_dtype == "nvfp4"
             self.use_fa2_nvfp4_kv = False
             if self.is_kvcache_nvfp4:

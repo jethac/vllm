@@ -163,6 +163,13 @@ class AttentionSpec(KVCacheSpec):
     dtype: torch.dtype
     kv_quant_mode: KVQuantMode = KVQuantMode.NONE
     page_size_padded: int | None = None
+    # The kv_cache_dtype string this layer resolved to (e.g. "nvfp4",
+    # "fp8_e4m3"), or None for unquantized layers. `dtype` alone is ambiguous
+    # for quantized caches (uint8 storage vs fp8_e4m3 op dtype), and with
+    # per-layer mixed KV dtypes (kv_cache_dtype_skip_layers overrides) the
+    # global cache_config.cache_dtype no longer describes every layer, so
+    # backends must read the layer's string from its spec.
+    cache_dtype_str: str | None = None
 
     @property
     def page_size_bytes(self) -> int:
@@ -274,6 +281,7 @@ class FullAttentionSpec(AttentionSpec):
             dtype=specs[0].dtype,
             kv_quant_mode=specs[0].kv_quant_mode,
             page_size_padded=specs[0].page_size_padded,
+            cache_dtype_str=specs[0].cache_dtype_str,
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
         )
