@@ -1272,7 +1272,18 @@ class ModelConfig:
 
     @property
     def is_mm_prefix_lm(self) -> bool:
-        return self.model_arch_config.is_mm_prefix_lm
+        if not self.model_arch_config.is_mm_prefix_lm:
+            return False
+        # Bidirectional mm-prefix masking only applies to multimodal
+        # token spans. With --language-model-only no such spans can
+        # ever arrive, so backends without mm-prefix support (e.g.
+        # FlashInfer) are valid for text-only serving of these models.
+        if (
+            self.multimodal_config is not None
+            and self.multimodal_config.language_model_only
+        ):
+            return False
+        return True
 
     def get_head_size(self) -> int:
         return self.model_arch_config.head_size
