@@ -1393,7 +1393,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             _ensure_vllm_nvfp4_kv_deswizzle_flag()
             logger.info_once(
                 "Using FlashInfer FA2 backend for NVFP4 KV cache on SM12x "
-                "with vLLM V-scale-factor deswizzle enabled."
+                "(V-scale-factor mode: %s).",
+                "linear, in-kernel deswizzle disabled"
+                if _vllm_nvfp4_linear_v_sf()
+                else "swizzled, in-kernel deswizzle enabled",
             )
 
         self.vo_split = _vo_split_factor(
