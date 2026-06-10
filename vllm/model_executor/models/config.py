@@ -92,7 +92,33 @@ class Gemma4Config(VerifyAndUpdateConfig):
             and max_head_dim > 256
             and vllm_config.attention_config.backend is None
         ):
+            import os
+
             cache_config = vllm_config.cache_config
+            if os.environ.get("VLLM_FLASHINFER_VOSPLIT", "") not in ("", "0"):
+                # Wholesale alternative to the TRITON_ATTN force for ANY KV
+                # dtype: FlashInfer serves every layer (one backend, so no
+                # mixed-backend divergence risk), with the >256 head-dim
+                # global layers running the FA2 two-pass VO split
+                # (head_dim_vo = head_size // 2). Cf. the ~9 tok/s Triton
+                # fallback reports (vllm-project/vllm#38887, #40677).
+                from vllm.v1.attention.backends.registry import (
+                    AttentionBackendEnum,
+                )
+
+                vllm_config.attention_config.backend = (
+                    AttentionBackendEnum.FLASHINFER
+                )
+                logger.info(
+                    "Gemma4 has heterogeneous head dimensions (head_dim=%d, "
+                    "global_head_dim=%d) and VLLM_FLASHINFER_VOSPLIT is "
+                    "set: forcing FLASHINFER with the FA2 VO split instead "
+                    "of TRITON_ATTN.",
+                    head_dim,
+                    global_head_dim,
+                )
+                return
+
             mixed_kv_requested = (
                 cache_config is not None
                 and cache_config.cache_dtype != "auto"
@@ -118,8 +144,6 @@ class Gemma4Config(VerifyAndUpdateConfig):
                     global_head_dim,
                 )
                 return
-
-            import os
 
             nvfp4_vosplit_requested = (
                 cache_config is not None

@@ -639,8 +639,17 @@ def _vllm_nvfp4_kv_vosplit_requested() -> bool:
     return value not in ("", "0")
 
 
-def _nvfp4_vo_split_factor(head_size: int, use_fa2_nvfp4_kv: bool) -> int:
-    """Number of VO passes for the SM12x FA2 NVFP4 path.
+def _vllm_flashinfer_vosplit_requested() -> bool:
+    """VLLM_FLASHINFER_VOSPLIT=1 opts head_size > 256 layers into the FA2
+    two-pass VO split for ALL KV dtypes (bf16/fp8/NVFP4). This is the
+    wholesale alternative to the Gemma 4 model-wide TRITON_ATTN force
+    (cf. vllm-project/vllm#38887, #40677)."""
+    value = os.environ.get("VLLM_FLASHINFER_VOSPLIT", "")
+    return value not in ("", "0")
+
+
+def _vo_split_factor(head_size: int, is_fa2_nvfp4: bool) -> int:
+    """Number of VO passes for the FlashInfer FA2 path.
 
     The FA2 kernel trait guard rejects HEAD_DIM_VO > 256 (the per-thread
     output-accumulator fragments do not fit the register budget), but
@@ -648,32 +657,42 @@ def _nvfp4_vo_split_factor(head_size: int, use_fa2_nvfp4_kv: bool) -> int:
     dimension: S = Q @ K^T and the softmax are identical per pass, and
     O = [P @ V_left | P @ V_right] concatenates with no LSE merge. So
     head_size 512 runs as two (head_dim_qk=512, head_dim_vo=256) passes
-    over zero-copy V half views.
+    over zero-copy V half views. Dtype-independent (the guard counts only
+    accumulator fragments); NVFP4 additionally needs the linear V-SF
+    layout so the scale factors slice along the head dim.
     """
-    if not use_fa2_nvfp4_kv or head_size <= 256:
+    if head_size <= 256:
         return 1
-    if not _vllm_nvfp4_kv_vosplit_requested():
-        raise ValueError(
-            f"NVFP4 KV with head_size={head_size} on the SM12x FA2 path "
-            "needs the two-pass VO split (the FA2 kernel caps HEAD_DIM_VO "
-            "at 256). Set VLLM_NVFP4_KV_VOSPLIT=1 and "
-            "VLLM_NVFP4_KV_LINEAR_V_SF=1 to enable it, or keep these "
-            "layers on a different KV dtype via "
-            "--kv-cache-dtype-skip-layers."
-        )
-    if not _vllm_nvfp4_linear_v_sf():
-        raise ValueError(
-            "VLLM_NVFP4_KV_VOSPLIT=1 requires VLLM_NVFP4_KV_LINEAR_V_SF=1: "
-            "the swizzled V-scale-factor layout spreads each 4-token group "
-            "across the full scale row and cannot be sliced along the head "
-            "dimension."
-        )
+    vosplit_all_dtypes = _vllm_flashinfer_vosplit_requested()
+    if is_fa2_nvfp4:
+        if not (vosplit_all_dtypes or _vllm_nvfp4_kv_vosplit_requested()):
+            raise ValueError(
+                f"NVFP4 KV with head_size={head_size} on the SM12x FA2 path "
+                "needs the two-pass VO split (the FA2 kernel caps "
+                "HEAD_DIM_VO at 256). Set VLLM_NVFP4_KV_VOSPLIT=1 and "
+                "VLLM_NVFP4_KV_LINEAR_V_SF=1 to enable it, or keep these "
+                "layers on a different KV dtype via "
+                "--kv-cache-dtype-skip-layers."
+            )
+        if not _vllm_nvfp4_linear_v_sf():
+            raise ValueError(
+                "The NVFP4 VO split requires VLLM_NVFP4_KV_LINEAR_V_SF=1: "
+                "the swizzled V-scale-factor layout spreads each 4-token "
+                "group across the full scale row and cannot be sliced "
+                "along the head dimension."
+            )
+    elif not vosplit_all_dtypes:
+        # Dense/fp8 KV: without the knob, keep the pre-existing behavior
+        # (backend selection / the Gemma4 TRITON_ATTN force handles >256).
+        return 1
     split = -(-head_size // 256)
-    if head_size % split != 0 or (head_size // split) % 16 != 0:
+    if head_size % split != 0 or (
+        is_fa2_nvfp4 and (head_size // split) % 16 != 0
+    ):
         raise ValueError(
-            "NVFP4 VO split needs head_size divisible into <=256-wide "
-            "chunks of whole 16-element scale blocks; got "
-            f"head_size={head_size}."
+            "The VO split needs head_size divisible into <=256-wide "
+            f"chunks{' of whole 16-element scale blocks' if is_fa2_nvfp4 else ''};"
+            f" got head_size={head_size}."
         )
     return split
 
@@ -1377,21 +1396,22 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 "with vLLM V-scale-factor deswizzle enabled."
             )
 
-        self.nvfp4_vo_split = _nvfp4_vo_split_factor(
+        self.vo_split = _vo_split_factor(
             self.head_dim, self.use_fa2_nvfp4_kv
         )
-        if self.nvfp4_vo_split > 1:
+        if self.vo_split > 1:
             # BatchDecodeWithPagedKVCacheWrapper.plan() has no head_dim_vo,
             # so route every request through the VO-split-planned prefill
             # wrapper: threshold 0 classifies nothing as decode, and a
             # causal qo_len==1 prefill computes exactly what decode would.
             self.reorder_batch_threshold = 0
             logger.info_once(
-                "NVFP4 KV VO split: head_size %d runs as %d FA2 passes of "
+                "FA2 VO split (%s KV): head_size %d runs as %d passes of "
                 "head_dim_vo=%d; decode requests use the prefill wrapper.",
+                self.cache_dtype,
                 self.head_dim,
-                self.nvfp4_vo_split,
-                self.head_dim // self.nvfp4_vo_split,
+                self.vo_split,
+                self.head_dim // self.vo_split,
             )
 
         self._cascade_wrapper = None  # Wrapper for cascade attention
@@ -1466,13 +1486,15 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 # FlashInfer only applies to attention, so we don't consider other types
                 # of KV spec (e.g. Mamba) here. This is mostly for type checking.
                 continue
-            if (
-                spec.head_size > 256
-                and spec.kv_quant_mode != KVQuantMode.NONE
-                and current_platform.is_device_capability_family(120)
-                and _vllm_nvfp4_kv_vosplit_requested()
+            if spec.head_size > 256 and (
+                _vllm_flashinfer_vosplit_requested()
+                or (
+                    spec.kv_quant_mode != KVQuantMode.NONE
+                    and current_platform.is_device_capability_family(120)
+                    and _vllm_nvfp4_kv_vosplit_requested()
+                )
             ):
-                # The NVFP4 VO-split group routes decodes through the
+                # The VO-split group routes decodes through the
                 # dynamically planned prefill wrapper, which cudagraph
                 # capture cannot replay. Piecewise graphs are unaffected.
                 return AttentionCGSupport.NEVER
@@ -1988,7 +2010,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         head_dim_qk=self.head_dim,
                         # == head_dim_qk unless the NVFP4 VO split is active;
                         # then the impl runs this wrapper once per V half.
-                        head_dim_vo=self.head_dim // self.nvfp4_vo_split,
+                        head_dim_vo=self.head_dim // self.vo_split,
                         page_size=self.page_size,
                         causal=True,
                         sm_scale=self.sm_scale,
@@ -2008,7 +2030,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
         ## DECODE PATHWAY
         if num_decodes > 0:
-            assert self.nvfp4_vo_split == 1, (
+            assert self.vo_split == 1, (
                 "NVFP4 VO split routes decodes through the prefill wrapper "
                 "(reorder_batch_threshold=0); the decode pathway should be "
                 "unreachable."
@@ -2121,7 +2143,7 @@ class FlashInferImpl(AttentionImpl):
         if self.use_fa2_nvfp4_kv:
             _ensure_vllm_nvfp4_kv_deswizzle_flag()
         self.fp4_data_dim = head_size // 2 if self.is_kvcache_nvfp4 else 0
-        self.nvfp4_vo_split = _nvfp4_vo_split_factor(
+        self.vo_split = _vo_split_factor(
             head_size, self.use_fa2_nvfp4_kv
         )
         self.logits_soft_cap = logits_soft_cap
@@ -2196,38 +2218,56 @@ class FlashInferImpl(AttentionImpl):
         if self.sinks is not None and self.sinks.dtype != torch.float32:
             self.sinks = self.sinks.to(torch.float32)
 
-    def _run_nvfp4_vo_split_prefill(
+    def _run_vo_split_prefill(
         self,
         wrapper: BatchPrefillWithPagedKVCacheWrapper,
         query: torch.Tensor,
-        kv_data: tuple[torch.Tensor, torch.Tensor],
-        kv_sf: tuple[torch.Tensor, torch.Tensor],
+        kv_cache: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        kv_sf: tuple[torch.Tensor, torch.Tensor] | None,
         out: torch.Tensor,
         *,
         k_scale: float,
         v_scale: float,
     ) -> None:
-        """Two-pass FA2 run for NVFP4 KV with head_size > 256.
+        """Multi-pass FA2 run for head_size > 256 (any KV dtype).
 
         The wrapper is planned with head_dim_vo = head_size // split, and
-        each pass consumes a zero-copy head-dim slice of the V data and V
-        scale factors: S = Q @ K^T and the softmax are recomputed
-        identically per pass, so the per-pass outputs concatenate exactly
-        (no LSE merge). narrow() keeps the full tensor's strides, which
-        the FA2 path requires: the K/V stride-equality check passes and
-        the run sizes its output from the V view's packed width. Requires
-        the linear V-SF layout (enforced in _nvfp4_vo_split_factor) —
-        the swizzled layout does not slice along the head dim.
+        each pass consumes a zero-copy head-dim slice of V (and, for
+        NVFP4, of the V scale factors): S = Q @ K^T and the softmax are
+        recomputed identically per pass, so the per-pass outputs
+        concatenate exactly (no LSE merge). narrow() keeps the full
+        tensor's strides, which the FA2 path requires: the K/V
+        stride-equality check passes and the run sizes its output from
+        the V view's width. NVFP4 additionally requires the linear V-SF
+        layout (enforced in _vo_split_factor) — the swizzled layout does
+        not slice along the head dim.
         """
-        k_data, v_data = kv_data
-        k_sf, v_sf = kv_sf
-        split = self.nvfp4_vo_split
+        split = self.vo_split
         head_chunk = self.head_size // split
-        data_step = head_chunk // 2  # packed e2m1, 2 elements per byte
-        sf_step = head_chunk // 16  # one fp8 scale per 16 elements
+        if self.is_kvcache_nvfp4:
+            assert isinstance(kv_cache, tuple) and kv_sf is not None
+            k_cache, v_cache = kv_cache
+            k_sf, v_sf = kv_sf
+            data_step = head_chunk // 2  # packed e2m1, 2 elements per byte
+            sf_step = head_chunk // 16  # one fp8 scale per 16 elements
+        else:
+            # Dense bf16/fp16 or fp8 KV: a stacked (num_pages, 2, ...)
+            # cache or an explicit (k, v) pair; V slices are plain
+            # element-width views and there are no scale factors.
+            if isinstance(kv_cache, tuple):
+                k_cache, v_cache = kv_cache
+            else:
+                k_cache, v_cache = kv_cache[:, 0], kv_cache[:, 1]
+            k_sf = v_sf = None
+            data_step = head_chunk
+            sf_step = 0
         for i in range(split):
-            v_data_i = v_data.narrow(-1, i * data_step, data_step)
-            v_sf_i = v_sf.narrow(-1, i * sf_step, sf_step)
+            v_cache_i = v_cache.narrow(-1, i * data_step, data_step)
+            kv_sf_i = (
+                (k_sf, v_sf.narrow(-1, i * sf_step, sf_step))
+                if v_sf is not None
+                else None
+            )
             # The kernel needs a contiguous output; write into a chunk
             # buffer and copy into the strided slice of the full output.
             out_i = torch.empty(
@@ -2237,11 +2277,11 @@ class FlashInferImpl(AttentionImpl):
             )
             wrapper.run(
                 query,
-                (k_data, v_data_i),
+                (k_cache, v_cache_i),
                 k_scale=k_scale,
                 v_scale=v_scale,
                 out=out_i,
-                kv_cache_sf=(k_sf, v_sf_i),
+                kv_cache_sf=kv_sf_i,
             )
             out.narrow(-1, i * head_chunk, head_chunk).copy_(out_i)
 
@@ -2735,10 +2775,11 @@ class FlashInferImpl(AttentionImpl):
                             },
                         )
 
-                    if self.nvfp4_vo_split > 1:
-                        assert isinstance(kv_cache_permute, tuple)
-                        assert isinstance(kv_cache_sf, tuple)
-                        self._run_nvfp4_vo_split_prefill(
+                    if self.vo_split > 1:
+                        if self.is_kvcache_nvfp4:
+                            assert isinstance(kv_cache_permute, tuple)
+                            assert isinstance(kv_cache_sf, tuple)
+                        self._run_vo_split_prefill(
                             prefill_wrapper,
                             prefill_query,
                             kv_cache_permute,
@@ -2804,7 +2845,7 @@ class FlashInferImpl(AttentionImpl):
                         and self.use_fa2_nvfp4_kv
                         # The replay re-plans with symmetric head dims, which
                         # the VO-split wrapper deliberately does not use.
-                        and self.nvfp4_vo_split == 1
+                        and self.vo_split == 1
                         and isinstance(prefill_wrapper, BatchPrefillWithPagedKVCacheWrapper)
                         and isinstance(kv_cache_permute, tuple)
                     ):
@@ -2988,7 +3029,7 @@ class FlashInferImpl(AttentionImpl):
                     ].copy_(out[:num_prefill_tokens].to(output.dtype))
 
         if num_decode_tokens > 0:
-            assert self.nvfp4_vo_split == 1, (
+            assert self.vo_split == 1, (
                 "NVFP4 VO split routes decodes through the prefill wrapper; "
                 "no tokens should reach the decode pathway."
             )
