@@ -1542,7 +1542,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         o_data_type=o_dtype,
                         idtype=torch.int32,
                         head_dim_qk=self.head_dim,
-                        head_dim_vo=self.head_dim,
+                        # Ctor jit_args override plan-time head_dim_vo, so
+                        # the VO split MUST be reflected here too: the 31B
+                        # full-NVFP4 smoke crashed at prefill.cuh:3215 with
+                        # NUM_MMA_D_VO=32 (vo=512 reached the kernel)
+                        # because this arg pinned the symmetric pair while
+                        # plan() asked for (512, 256).
+                        head_dim_vo=self.head_dim // self.vo_split,
                         use_sliding_window=self.window_left >= 0,
                         use_logits_soft_cap=(self.logits_soft_cap or 0.0) > 0,
                     )
