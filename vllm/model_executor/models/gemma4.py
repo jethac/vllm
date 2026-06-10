@@ -495,6 +495,9 @@ class Gemma4Attention(nn.Module):
         # FlashInfer, but its FA2 kernel rejects it at run time (trait guard
         # in prefill.cuh, dtype-independent — probed on GB10), so automatic
         # per-layer fallback does not happen and the pin must be explicit.
+        # Full-NVFP4 alternative (no skip layers): VLLM_NVFP4_KV_VOSPLIT=1
+        # keeps these layers on FlashInfer via the two-pass VO split;
+        # mixed_kv_requested is then False, so no pin happens here.
         attn_backend_override = None
         mixed_kv_requested = (
             cache_config is not None

@@ -119,6 +119,29 @@ class Gemma4Config(VerifyAndUpdateConfig):
                 )
                 return
 
+            import os
+
+            nvfp4_vosplit_requested = (
+                cache_config is not None
+                and cache_config.cache_dtype == "nvfp4"
+                and os.environ.get("VLLM_NVFP4_KV_VOSPLIT", "") not in ("", "0")
+            )
+            if nvfp4_vosplit_requested:
+                # Full NVFP4 KV on every layer: TRITON_ATTN cannot read the
+                # NVFP4 cache at all, and FlashInfer handles the >256
+                # head-dim global layers via the two-pass VO split
+                # (head_dim_vo = head_size // 2), so no backend force is
+                # needed or wanted.
+                logger.info(
+                    "Gemma4 has heterogeneous head dimensions (head_dim=%d, "
+                    "global_head_dim=%d) and VLLM_NVFP4_KV_VOSPLIT is set: "
+                    "keeping per-layer attention backend resolution so the "
+                    "global layers run FlashInfer's NVFP4 VO split.",
+                    head_dim,
+                    global_head_dim,
+                )
+                return
+
             from vllm.v1.attention.backends.registry import (
                 AttentionBackendEnum,
             )
