@@ -602,7 +602,28 @@ def _spark_kv_trace(event: str, payload: dict[str, object]) -> None:
     logger.warning("Spark KV trace: %s", line)
 
 
+def _vllm_nvfp4_linear_v_sf() -> bool:
+    """One knob couples writer and reader V-scale-factor layouts.
+
+    VLLM_NVFP4_KV_LINEAR_V_SF=1 makes the NVFP4 cache writer store V scale
+    factors linearly (same layout as K; read by
+    reshape_and_cache_nvfp4_dispatch in C++) and makes the FlashInfer FA2
+    reader consume them without the in-kernel de-swizzle. Linear V-SF is
+    required for head-dim-sliced V views (Gemma 4 D=512 VO-split) because
+    the trtllm 4-token swizzle does not commute with head-dim slicing.
+    """
+    value = os.environ.get("VLLM_NVFP4_KV_LINEAR_V_SF", "")
+    return value not in ("", "0")
+
+
 def _ensure_vllm_nvfp4_kv_deswizzle_flag() -> None:
+    if _vllm_nvfp4_linear_v_sf():
+        # Writer stores V-SF linearly; the reader must NOT de-swizzle.
+        logger.info_once(
+            "VLLM_NVFP4_KV_LINEAR_V_SF=1: NVFP4 V scale factors are linear; "
+            "FlashInfer in-kernel V-SF de-swizzle disabled."
+        )
+        return
     extra_flags = os.environ.get("FLASHINFER_EXTRA_CUDAFLAGS", "")
     if "FLASHINFER_PAGED_V_SF_DESWIZZLE" in extra_flags:
         return
