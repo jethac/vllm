@@ -585,6 +585,26 @@ def test_sequence_parallelism_requires_full_graph_compilation(
     ) == expected_enable_sp
 
 
+def test_piecewise_cudagraph_sizes_align_for_spec_decode():
+    from vllm.v1.attention.backend import AttentionCGSupport
+
+    compilation_config = CompilationConfig(
+        cudagraph_capture_sizes=[1, 2, 4, 8, 16, 24, 32],
+        max_cudagraph_capture_size=32,
+        cudagraph_mode=CUDAGraphMode.PIECEWISE,
+    )
+
+    resolved_mode = compilation_config.resolve_cudagraph_mode_and_sizes(
+        min_cg_support=AttentionCGSupport.ALWAYS,
+        min_cg_attn_backend="test",
+        uniform_decode_query_len=16,
+    )
+
+    assert resolved_mode == CUDAGraphMode.PIECEWISE
+    assert compilation_config.cudagraph_capture_sizes == [16, 32]
+    assert compilation_config.max_cudagraph_capture_size == 32
+
+
 def test_cached_compilation_config(default_vllm_config):
     import torch
     from torch._inductor.utils import run_and_get_code

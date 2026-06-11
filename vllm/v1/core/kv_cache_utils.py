@@ -20,6 +20,7 @@ from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import format_gib
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
@@ -1053,14 +1054,41 @@ def unify_kv_cache_spec_page_size(
             new_kv_cache_spec[layer_name] = layer_spec
         else:
             layer_page_size = layer_spec.page_size_bytes
-            if max_page_size % layer_page_size != 0:
-                raise NotImplementedError(
-                    "The page size of the layer is not divisible by the "
-                    "maximum page size. Cannot unify by adjusting block_size."
-                )
             ratio = max_page_size // layer_page_size
-            new_block_size = layer_spec.block_size * ratio
-            new_spec = replace(layer_spec, block_size=new_block_size)
+            if max_page_size % layer_page_size != 0:
+                # Mixed per-layer KV dtypes (e.g. NVFP4 sliding-window KV
+                # with bf16/fp8 global KV) rarely divide evenly. Scale the
+                # block size to the largest whole multiple that fits, then
+                # pad the remainder so physical page sizes still match.
+                # Scaling by an integer preserves any multiple-of block
+                # size constraint the original block size satisfied.
+                if ratio == 0:
+                    raise NotImplementedError(
+                        "Cannot unify page sizes: a single block of the "
+                        "smaller-page layer does not fit in the largest "
+                        "page."
+                    )
+                new_block_size = layer_spec.block_size * ratio
+                new_spec = replace(
+                    layer_spec,
+                    block_size=new_block_size,
+                    page_size_padded=max_page_size,
+                )
+                waste = max_page_size - layer_page_size * ratio
+                logger.warning(
+                    "Padding KV cache pages of layer %s from %d to %d bytes "
+                    "(block_size %d -> %d, %.2f%% of this layer's pool "
+                    "wasted) to unify page sizes across mixed KV specs.",
+                    layer_name,
+                    layer_page_size * ratio,
+                    max_page_size,
+                    layer_spec.block_size,
+                    new_block_size,
+                    100.0 * waste / max_page_size,
+                )
+            else:
+                new_block_size = layer_spec.block_size * ratio
+                new_spec = replace(layer_spec, block_size=new_block_size)
             assert new_spec.page_size_bytes == max_page_size
             new_kv_cache_spec[layer_name] = new_spec
     return new_kv_cache_spec
@@ -1346,6 +1374,24 @@ def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
         kv_cache_spec
     ) or UniformTypeKVCacheSpecs.is_uniform_type(kv_cache_spec):
         return
+
+    # Mixed per-layer KV dtypes (e.g. NVFP4 on sliding-window layers with
+    # bf16/fp8 on full-attention layers via kv_cache_dtype_skip_layers)
+    # cannot be folded into a single spec type: the conversions below would
+    # hand merge() specs that differ in dtype/kv_quant_mode and die on an
+    # opaque assertion. Such models need the hybrid KV cache manager.
+    attn_dtypes = {
+        (spec.dtype, spec.kv_quant_mode)
+        for spec in kv_cache_spec.values()
+        if isinstance(spec, AttentionSpec)
+    }
+    if len(attn_dtypes) > 1:
+        raise ValueError(
+            "This model uses mixed per-layer KV cache dtypes, which "
+            "requires the hybrid KV cache manager. Remove "
+            "--disable-hybrid-kv-cache-manager (or the setting that "
+            "disabled it) to serve with mixed KV dtypes."
+        )
 
     logger.warning(
         "Hybrid KV cache manager is disabled for this hybrid model, "

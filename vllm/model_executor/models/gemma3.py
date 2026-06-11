@@ -49,6 +49,11 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.sequence import IntermediateTensors
+from vllm.utils.spark_tensor_trace import (
+    spark_tensor_trace,
+    spark_tensor_trace_should_emit,
+    spark_trace_last_token_summary,
+)
 from vllm.v1.attention.backend import AttentionType
 
 from .interfaces import SupportsLoRA, SupportsPP
@@ -113,6 +118,7 @@ class Gemma3Attention(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self.prefix = prefix
         self.hidden_size = hidden_size
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
@@ -154,7 +160,9 @@ class Gemma3Attention(nn.Module):
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
         layer_idx = extract_layer_index(prefix)
+        self.layer_idx = layer_idx
         layer_type = config.layer_types[layer_idx]
+        self.layer_type = layer_type
         self.is_sliding = layer_type == "sliding_attention"
         sliding_window = config.sliding_window if self.is_sliding else None
 
@@ -221,7 +229,31 @@ class Gemma3Attention(nn.Module):
 
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
+        if spark_tensor_trace_should_emit("gemma3_attention", self.prefix):
+            spark_tensor_trace(
+                "gemma3_attention",
+                {
+                    "layer_name": self.prefix,
+                    "layer_idx": int(self.layer_idx),
+                    "layer_type": self.layer_type,
+                    "positions": spark_trace_last_token_summary(positions),
+                    "q_last": spark_trace_last_token_summary(q),
+                    "k_last": spark_trace_last_token_summary(k),
+                    "v_last": spark_trace_last_token_summary(v),
+                    "attn_output_last": spark_trace_last_token_summary(attn_output),
+                },
+            )
         output, _ = self.o_proj(attn_output)
+        if spark_tensor_trace_should_emit("gemma3_attention_o_proj", self.prefix):
+            spark_tensor_trace(
+                "gemma3_attention_o_proj",
+                {
+                    "layer_name": self.prefix,
+                    "layer_idx": int(self.layer_idx),
+                    "layer_type": self.layer_type,
+                    "output_last": spark_trace_last_token_summary(output),
+                },
+            )
         return output
 
 
@@ -234,6 +266,9 @@ class Gemma3DecoderLayer(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.prefix = prefix
+        self.layer_idx = extract_layer_index(prefix)
+        self.layer_type = config.layer_types[self.layer_idx]
         self.hidden_size = config.hidden_size
         self.self_attn = Gemma3Attention(
             config=config,
@@ -283,13 +318,66 @@ class Gemma3DecoderLayer(nn.Module):
             hidden_states=hidden_states,
             **kwargs,
         )
+        if spark_tensor_trace_should_emit("gemma3_layer_attn_out", self.prefix):
+            spark_tensor_trace(
+                "gemma3_layer_attn_out",
+                {
+                    "layer_name": self.prefix,
+                    "layer_idx": int(self.layer_idx),
+                    "layer_type": self.layer_type,
+                    "hidden_last": spark_trace_last_token_summary(hidden_states),
+                    "residual_last": spark_trace_last_token_summary(residual),
+                },
+            )
         hidden_states = self.post_attention_layernorm(hidden_states)
+        if spark_tensor_trace_should_emit("gemma3_layer_post_attn_norm", self.prefix):
+            spark_tensor_trace(
+                "gemma3_layer_post_attn_norm",
+                {
+                    "layer_name": self.prefix,
+                    "layer_idx": int(self.layer_idx),
+                    "layer_type": self.layer_type,
+                    "hidden_last": spark_trace_last_token_summary(hidden_states),
+                },
+            )
 
         hidden_states, residual = self.pre_feedforward_layernorm(
             hidden_states, residual
         )
+        if spark_tensor_trace_should_emit("gemma3_layer_pre_ff_norm", self.prefix):
+            spark_tensor_trace(
+                "gemma3_layer_pre_ff_norm",
+                {
+                    "layer_name": self.prefix,
+                    "layer_idx": int(self.layer_idx),
+                    "layer_type": self.layer_type,
+                    "hidden_last": spark_trace_last_token_summary(hidden_states),
+                    "residual_last": spark_trace_last_token_summary(residual),
+                },
+            )
         hidden_states = self.mlp(hidden_states)
+        if spark_tensor_trace_should_emit("gemma3_layer_mlp_out", self.prefix):
+            spark_tensor_trace(
+                "gemma3_layer_mlp_out",
+                {
+                    "layer_name": self.prefix,
+                    "layer_idx": int(self.layer_idx),
+                    "layer_type": self.layer_type,
+                    "hidden_last": spark_trace_last_token_summary(hidden_states),
+                },
+            )
         hidden_states = self.post_feedforward_layernorm(hidden_states)
+        if spark_tensor_trace_should_emit("gemma3_layer_post_ff_norm", self.prefix):
+            spark_tensor_trace(
+                "gemma3_layer_post_ff_norm",
+                {
+                    "layer_name": self.prefix,
+                    "layer_idx": int(self.layer_idx),
+                    "layer_type": self.layer_type,
+                    "hidden_last": spark_trace_last_token_summary(hidden_states),
+                    "residual_last": spark_trace_last_token_summary(residual),
+                },
+            )
         return hidden_states, residual
 
 
@@ -363,6 +451,15 @@ class Gemma3Model(nn.Module):
                 {"hidden_states": hidden_states, "residual": residual}
             )
         hidden_states, _ = self.norm(hidden_states, residual)
+        if spark_tensor_trace_should_emit("gemma3_final_hidden", "model"):
+            spark_tensor_trace(
+                "gemma3_final_hidden",
+                {
+                    "layer_name": "model",
+                    "hidden_last": spark_trace_last_token_summary(hidden_states),
+                    "residual_last": spark_trace_last_token_summary(residual),
+                },
+            )
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -492,7 +589,27 @@ class Gemma3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
+        if spark_tensor_trace_should_emit("gemma3_logits_input", "lm_head"):
+            spark_tensor_trace(
+                "gemma3_logits_input",
+                {
+                    "layer_name": "lm_head",
+                    "hidden_last": spark_trace_last_token_summary(hidden_states),
+                },
+            )
         logits = self.logits_processor(self.lm_head, hidden_states)
+        if spark_tensor_trace_should_emit("gemma3_logits", "lm_head"):
+            spark_tensor_trace(
+                "gemma3_logits",
+                {
+                    "layer_name": "lm_head",
+                    "logits_last": spark_trace_last_token_summary(
+                        logits,
+                        include_values=False,
+                        topk=20,
+                    ),
+                },
+            )
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
