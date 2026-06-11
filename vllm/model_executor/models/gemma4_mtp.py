@@ -47,7 +47,11 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.sequence import IntermediateTensors
 
-from .gemma4 import Gemma4MLP, _get_text_config
+from .gemma4 import (
+    Gemma4MLP,
+    _get_text_config,
+    gemma4_global_attn_backend_override,
+)
 from .utils import (
     AutoWeightsLoader,
     WeightsMapper,
@@ -216,6 +220,19 @@ class Gemma4MTPAttention(nn.Module):
             is_neox_style=True,
         )
 
+        # Per-layer mixed KV: mirror Gemma4Attention's explicit backend pin
+        # for global D>256 layers. The drafter reads the TARGET's cache via
+        # KV sharing, so its global layers face the same selector-vs-kernel
+        # head-512 gap. Without the pin the drafter's global layers land on
+        # FlashInfer while the target's are pinned to Triton, and spec
+        # decode crashes at the first draft step. Full-NVFP4
+        # (VLLM_NVFP4_KV_VOSPLIT=1) and all-dtype VO split
+        # (VLLM_FLASHINFER_VOSPLIT=1) need no pin: FlashInfer handles
+        # D>256 via the two-pass VO split there.
+        attn_backend_override = gemma4_global_attn_backend_override(
+            cache_config, self.is_sliding, self.head_dim
+        )
+
         # kv_sharing_target_layer_name is set after model construction
         # by Gemma4Proposer._setup_gemma4_kv_sharing().
         self.is_kv_shared_layer = True
@@ -228,6 +245,7 @@ class Gemma4MTPAttention(nn.Module):
             quant_config=quant_config,
             logits_soft_cap=attn_logits_soft_cap,
             per_layer_sliding_window=sliding_window,
+            attn_backend=attn_backend_override,
             prefix=f"{prefix}.attn",
         )
 

@@ -203,6 +203,54 @@ def gemma4_routing_function_torch(
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
 
+def gemma4_global_attn_backend_override(
+    cache_config: CacheConfig | None,
+    is_sliding: bool,
+    head_dim: int,
+):
+    """Backend pin for Gemma 4 global (D>256) attention layers under
+    per-layer mixed KV (quantized cache_dtype + skip-layers fallback).
+
+    The selector's validate_configuration accepts head_size=512 for
+    FlashInfer, but its FA2 kernel rejects it at run time (trait guard
+    in prefill.cuh, dtype-independent — probed on GB10), so automatic
+    per-layer fallback does not happen and the pin must be explicit.
+    Full-NVFP4 alternative (no skip layers): VLLM_NVFP4_KV_VOSPLIT=1
+    keeps these layers on FlashInfer via the two-pass VO split;
+    mixed_kv_requested is then False, so no pin happens here.
+    VLLM_FLASHINFER_VOSPLIT=1 (any-dtype VO split) likewise supersedes
+    the pin: FlashInfer handles head_dim > 256 directly.
+
+    Used by both Gemma4Attention (target) and Gemma4MTPAttention
+    (assistant drafter): the drafter reads the target's cache via KV
+    sharing, so both must resolve to the same backend per layer type.
+
+    Returns the backend class to pin, or None to keep selector
+    resolution.
+    """
+    import os
+
+    mixed_kv_requested = (
+        cache_config is not None
+        and cache_config.cache_dtype != "auto"
+        and bool(cache_config.kv_cache_dtype_skip_layers)
+    )
+    vosplit_all_dtypes = os.environ.get("VLLM_FLASHINFER_VOSPLIT", "") not in (
+        "",
+        "0",
+    )
+    if (
+        mixed_kv_requested
+        and not vosplit_all_dtypes
+        and not is_sliding
+        and head_dim > 256
+    ):
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        return AttentionBackendEnum.TRITON_ATTN.get_class()
+    return None
+
+
 def _get_text_config(config):
     """Dereference text_config if config is a nested Gemma4Config.
 
@@ -489,43 +537,9 @@ class Gemma4Attention(nn.Module):
             is_neox_style=True,
         )
 
-        # Per-layer mixed KV (quantized cache_dtype + skip-layers fallback):
-        # global D>256 layers must be pinned to a head-size-capable backend.
-        # History: the selector's validate_configuration used to accept
-        # head_size=512 for FlashInfer while its FA2 kernel rejects it at
-        # run time (trait guard in prefill.cuh, dtype-independent — probed
-        # on GB10), so automatic per-layer fallback did not happen and the
-        # pin had to be explicit. FlashInferBackend.supports_combination
-        # now rejects head_size > 256 on CC 12.x unless a VO-split knob is
-        # set, so the automatic fallback lands on Triton there too; the
-        # pin stays as the deterministic choice (and for non-12.x CCs,
-        # where the selector still over-promises head-512 — see the
-        # campaign's draft upstream issue).
-        # Full-NVFP4 alternative (no skip layers): VLLM_NVFP4_KV_VOSPLIT=1
-        # keeps these layers on FlashInfer via the two-pass VO split;
-        # mixed_kv_requested is then False, so no pin happens here.
-        # VLLM_FLASHINFER_VOSPLIT=1 (any-dtype VO split) likewise
-        # supersedes the pin: FlashInfer handles head_dim > 256 directly.
-        attn_backend_override = None
-        mixed_kv_requested = (
-            cache_config is not None
-            and cache_config.cache_dtype != "auto"
-            and bool(cache_config.kv_cache_dtype_skip_layers)
+        attn_backend_override = gemma4_global_attn_backend_override(
+            cache_config, self.is_sliding, self.head_dim
         )
-        import os
-
-        vosplit_all_dtypes = os.environ.get(
-            "VLLM_FLASHINFER_VOSPLIT", ""
-        ) not in ("", "0")
-        if (
-            mixed_kv_requested
-            and not vosplit_all_dtypes
-            and not self.is_sliding
-            and self.head_dim > 256
-        ):
-            from vllm.v1.attention.backends.registry import AttentionBackendEnum
-
-            attn_backend_override = AttentionBackendEnum.TRITON_ATTN.get_class()
 
         self.attn = Attention(
             self.num_heads,
