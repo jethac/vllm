@@ -101,6 +101,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.inputs import (
     BatchedTensorInputs,
+    MultiModalFeatureSpec,
     MultiModalKwargsItem,
     PlaceholderRange,
 )
@@ -314,6 +315,39 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         del self._routed_experts
 
         return output
+
+
+def mm_prefix_doc_ranges_for_request(
+    mm_features: list[MultiModalFeatureSpec],
+    sliding_window: int | None,
+) -> list[tuple[int, int]]:
+    """Per-request bidirectional doc ranges for mm-prefix (PrefixLM) models.
+
+    Modality policy (matches the HF Gemma4 reference implementation,
+    `get_block_sequence_ids_for_mask`: mm_token_type_ids 1=image and
+    2=video form bidirectional blocks; 0=text and 3=audio map to block
+    -1, i.e. strictly causal):
+
+    - IMAGE and VIDEO spans attend bidirectionally among themselves and
+      therefore contribute doc ranges.
+    - AUDIO tokens are strictly causal in the language model (the audio
+      tower is bidirectional internally, but its soft tokens are decoded
+      causally), so audio features contribute NO ranges on any layer.
+
+    Ranges longer than the text config's ``sliding_window`` are dropped
+    (window guard) to prevent early tokens from attending across the
+    entire span.
+    """
+    doc_ranges: list[tuple[int, int]] = []
+    for mm_feature in mm_features:
+        if mm_feature.modality == "audio":
+            continue
+        pos_info = mm_feature.mm_position
+        for r in pos_info.extract_embeds_range():
+            if sliding_window is not None and (r[1] - r[0] + 1) > sliding_window:
+                continue
+            doc_ranges.append(r)
+    return doc_ranges
 
 
 def _copy_pooler_output_to_cpu(
@@ -2294,6 +2328,22 @@ class GPUModelRunner(
             # GPU tensors are authoritative in async mode.
             seq_lens_cpu = None
             num_computed_tokens_cpu = None
+
+        # Compute mm_prefix bidirectional ranges before building
+        # attention metadata so builders handle them during build().
+        # Ranges exceeding sliding_window are skipped to prevent
+        # early tokens from attending across the entire image span.
+        req_doc_ranges: dict[int, list[tuple[int, int]]] | None = None
+        if self.is_mm_prefix_lm:
+            req_doc_ranges = {}
+            hf_text_config = self.model_config.hf_text_config
+            _bidi_sw = getattr(hf_text_config, "sliding_window", None)
+            for req_id in self.input_batch.req_ids:
+                req_state = self.requests[req_id]
+                req_idx = self.input_batch.req_id_to_index[req_id]
+                req_doc_ranges[req_idx] = mm_prefix_doc_ranges_for_request(
+                    req_state.mm_features, _bidi_sw
+                )
 
         cm_base = CommonAttentionMetadata(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
