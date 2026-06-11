@@ -12,6 +12,12 @@ model-wide TRITON_ATTN force. These tests pin:
    on CC 12.x (the banked selector-vs-kernel head-512 discrepancy), and
 3. _vo_split_factor knob semantics.
 
+DEFAULT FLIP (Amendment 3, OVERNIGHT_LADDER_PLAN_20260612): the knob is
+now DEFAULT-ON; VLLM_FLASHINFER_BF16_GEMMA=0 is the escape hatch. Only
+knob-unset text-only bf16 Gemma cells on CC 12.x flipped expectation;
+the mm carve-out, quantized-KV routes, explicit --attention-backend, and
+non-CC-12.x behavior are pinned unchanged below.
+
 Everything runs under a mocked platform/capability; no CUDA required.
 """
 
@@ -121,9 +127,19 @@ def _gemma4_route(vllm_config):
 
 
 class TestGemma4Routing:
-    def test_knob_off_cc12_bf16_forces_triton(self, fake_cc):
-        """Baseline upstream behavior on CC 12.x: no FA4 -> Triton force."""
+    def test_default_cc12_bf16_forces_flashinfer(self, fake_cc):
+        """FLIPPED by the Amendment 3 default flip: knob unset, text-only
+        bf16 Gemma 4 on CC 12.x now routes to FLASHINFER by default
+        (was: upstream no-FA4 branch -> model-wide TRITON_ATTN force)."""
         fake_cc(CC12_0)
+        cfg = _mock_vllm_config()
+        assert _gemma4_route(cfg) == AttentionBackendEnum.FLASHINFER
+
+    def test_knob_zero_cc12_bf16_restores_triton_force(self, fake_cc, monkeypatch):
+        """Escape hatch: =0 restores the pre-flip upstream behavior on
+        CC 12.x (no FA4 -> model-wide Triton force)."""
+        fake_cc(CC12_0)
+        monkeypatch.setenv(KNOB, "0")
         cfg = _mock_vllm_config()
         assert _gemma4_route(cfg) == AttentionBackendEnum.TRITON_ATTN
 
@@ -151,45 +167,63 @@ class TestGemma4Routing:
         cfg = _mock_vllm_config(head_dim=256, global_head_dim=256)
         assert _gemma4_route(cfg) == AttentionBackendEnum.FLASHINFER
 
-    def test_knob_on_hopper_does_not_route(self, fake_cc, monkeypatch):
-        """CC scope: the knob must not leak outside 12.x."""
+    @pytest.mark.parametrize("knob", [None, "1"])
+    def test_hopper_does_not_route(self, fake_cc, monkeypatch, knob):
+        """CC scope: neither the default-on state nor an explicit =1 may
+        leak outside 12.x."""
         fake_cc(CC9_0)
-        monkeypatch.setenv(KNOB, "1")
+        if knob is not None:
+            monkeypatch.setenv(KNOB, knob)
         cfg = _mock_vllm_config()
         assert _gemma4_route(cfg) == AttentionBackendEnum.TRITON_ATTN
 
+    @pytest.mark.parametrize("knob", [None, "1"])
     @pytest.mark.parametrize("cache_dtype", ["fp8", "fp8_e4m3", "nvfp4"])
-    def test_knob_on_quantized_kv_does_not_route(
-        self, fake_cc, monkeypatch, cache_dtype
+    def test_quantized_kv_does_not_route(
+        self, fake_cc, monkeypatch, cache_dtype, knob
     ):
-        """Dtype scope: quantized-KV configs keep their own routes."""
+        """Dtype scope: quantized-KV configs keep their own routes, both
+        under the flipped default (knob unset) and explicit =1."""
         fake_cc(CC12_0)
-        monkeypatch.setenv(KNOB, "1")
+        if knob is not None:
+            monkeypatch.setenv(KNOB, knob)
         cfg = _mock_vllm_config(cache_dtype=cache_dtype)
         assert _gemma4_route(cfg) == AttentionBackendEnum.TRITON_ATTN
 
-    def test_knob_on_explicit_user_backend_wins(self, fake_cc, monkeypatch):
+    @pytest.mark.parametrize("knob", [None, "1"])
+    def test_explicit_user_backend_wins(self, fake_cc, monkeypatch, knob):
+        """Explicit --attention-backend is never overridden, including by
+        the flipped default."""
         fake_cc(CC12_0)
-        monkeypatch.setenv(KNOB, "1")
+        if knob is not None:
+            monkeypatch.setenv(KNOB, knob)
         cfg = _mock_vllm_config(backend=AttentionBackendEnum.TRITON_ATTN)
         assert _gemma4_route(cfg) == AttentionBackendEnum.TRITON_ATTN
 
-    def test_knob_on_mm_prefix_lm_without_mm_knob_does_not_route(
-        self, fake_cc, monkeypatch
+    @pytest.mark.parametrize("knob", [None, "1"])
+    def test_mm_prefix_lm_without_mm_knob_does_not_route(
+        self, fake_cc, monkeypatch, knob
     ):
-        """Multimodal Gemma (mm-prefix spans live) cannot be forced onto
-        FlashInfer without VLLM_FLASHINFER_MM_PREFIX: backend validation
-        would hard-fail at startup. Upstream route must stand."""
+        """mm carve-out, UNCHANGED by the default flip: multimodal Gemma
+        (mm-prefix spans live) cannot be forced onto FlashInfer without
+        VLLM_FLASHINFER_MM_PREFIX — backend validation would hard-fail at
+        startup. Upstream (Triton-capable) route must stand whether the
+        bf16 routing is default-on (knob unset) or explicit =1."""
         fake_cc(CC12_0)
-        monkeypatch.setenv(KNOB, "1")
+        if knob is not None:
+            monkeypatch.setenv(KNOB, knob)
         cfg = _mock_vllm_config(is_mm_prefix_lm=True)
         assert _gemma4_route(cfg) == AttentionBackendEnum.TRITON_ATTN
 
-    def test_knob_on_mm_prefix_lm_with_mm_knob_routes(
-        self, fake_cc, monkeypatch
-    ):
+    @pytest.mark.parametrize("knob", [None, "1"])
+    def test_mm_prefix_lm_with_mm_knob_routes(self, fake_cc, monkeypatch, knob):
+        """Per the Amendment 3 carve-out wording ("mm spans keep Triton
+        unless VLLM_FLASHINFER_MM_PREFIX is set"): with MM_PREFIX set the
+        guard stands down, so the bf16 routing applies — by default
+        (knob unset) just as with explicit =1."""
         fake_cc(CC12_0)
-        monkeypatch.setenv(KNOB, "1")
+        if knob is not None:
+            monkeypatch.setenv(KNOB, knob)
         monkeypatch.setenv("VLLM_FLASHINFER_MM_PREFIX", "1")
         cfg = _mock_vllm_config(is_mm_prefix_lm=True)
         assert _gemma4_route(cfg) == AttentionBackendEnum.FLASHINFER
@@ -222,8 +256,18 @@ class TestGemma4Routing:
 
 
 class TestGemma3Routing:
-    def test_knob_off_leaves_backend_unset(self, fake_cc):
+    def test_default_cc12_bf16_forces_flashinfer(self, fake_cc):
+        """FLIPPED by the Amendment 3 default flip: knob unset, text-only
+        bf16 Gemma 3 on CC 12.x now routes to FLASHINFER by default
+        (was: backend left unset for upstream priority order)."""
         fake_cc(CC12_0)
+        cfg = _mock_vllm_config(global_head_dim=None)
+        assert _gemma3_route(cfg) == AttentionBackendEnum.FLASHINFER
+
+    def test_knob_zero_leaves_backend_unset(self, fake_cc, monkeypatch):
+        """Escape hatch: =0 restores the pre-flip upstream selection."""
+        fake_cc(CC12_0)
+        monkeypatch.setenv(KNOB, "0")
         cfg = _mock_vllm_config(global_head_dim=None)
         assert _gemma3_route(cfg) is None
 
@@ -236,15 +280,19 @@ class TestGemma3Routing:
         cfg = _mock_vllm_config(global_head_dim=None)
         assert _gemma3_route(cfg) == AttentionBackendEnum.FLASHINFER
 
-    def test_knob_on_hopper_does_not_route(self, fake_cc, monkeypatch):
+    @pytest.mark.parametrize("knob", [None, "1"])
+    def test_hopper_does_not_route(self, fake_cc, monkeypatch, knob):
         fake_cc(CC9_0)
-        monkeypatch.setenv(KNOB, "1")
+        if knob is not None:
+            monkeypatch.setenv(KNOB, knob)
         cfg = _mock_vllm_config(global_head_dim=None)
         assert _gemma3_route(cfg) is None
 
-    def test_knob_on_fp8_kv_does_not_route(self, fake_cc, monkeypatch):
+    @pytest.mark.parametrize("knob", [None, "1"])
+    def test_fp8_kv_does_not_route(self, fake_cc, monkeypatch, knob):
         fake_cc(CC12_0)
-        monkeypatch.setenv(KNOB, "1")
+        if knob is not None:
+            monkeypatch.setenv(KNOB, knob)
         cfg = _mock_vllm_config(cache_dtype="fp8", global_head_dim=None)
         assert _gemma3_route(cfg) is None
 
@@ -277,15 +325,33 @@ class TestFlashInferHead512SelectorHonesty:
         assert _validate(256, kv, capability) == []
 
     @pytest.mark.parametrize("capability", [CC12_0, CC12_1])
-    @pytest.mark.parametrize("kv", ["auto", "bfloat16", "fp8"])
-    def test_head512_rejected_without_knobs(self, capability, kv):
-        """The resolved discrepancy: the FA2 kernel trait guard rejects
-        HEAD_DIM_VO > 256 at runtime, so the selector must reject it at
-        selection time when no VO-split knob is set."""
-        reasons = _validate(512, kv, capability)
+    @pytest.mark.parametrize("kv", ["auto", "bfloat16"])
+    def test_head512_bf16_valid_by_default(self, capability, kv):
+        """FLIPPED by the Amendment 3 default flip: knob unset, bf16/auto
+        KV head-512 on CC 12.x now validates (the default-on knob vouches
+        for the FA2 two-pass VO split). Was: rejected without knobs."""
+        assert _validate(512, kv, capability) == []
+
+    @pytest.mark.parametrize("kv", ["auto", "bfloat16"])
+    def test_head512_bf16_knob_zero_rejected(self, monkeypatch, kv):
+        """Escape hatch: =0 restores the honest pre-flip rejection (the
+        FA2 kernel trait guard rejects HEAD_DIM_VO > 256 at runtime, so
+        with the split disabled the selector must reject at selection
+        time)."""
+        monkeypatch.setenv(KNOB, "0")
+        reasons = _validate(512, kv, CC12_1)
+        assert any("VO split" in r or "VO-split" in r for r in reasons), reasons
+
+    @pytest.mark.parametrize("capability", [CC12_0, CC12_1])
+    def test_head512_fp8_rejected_without_knobs(self, capability):
+        """UNCHANGED by the default flip (fp8 routes untouched): the
+        default-on knob only vouches for bf16/'auto' KV; fp8 head-512
+        still needs an explicit VO-split opt-in."""
+        reasons = _validate(512, "fp8", capability)
         assert any("VO split" in r or "VO-split" in r for r in reasons), reasons
 
     def test_head512_nvfp4_rejected_without_knobs(self):
+        """UNCHANGED by the default flip (nvfp4 routes untouched)."""
         reasons = _validate(512, "nvfp4", CC12_1)
         assert any("VO split" in r or "VO-split" in r for r in reasons), reasons
 
@@ -325,9 +391,10 @@ class TestFlashInferHead512SelectorHonesty:
         assert _validate(512, "auto", DeviceCapability(10, 0)) == []
 
     def test_triton_fallback_cell_is_reachable(self):
-        """With FlashInfer honestly rejecting bf16 head-512 on CC 12.x
-        (knobs off), per-layer automatic fallback must have a valid
-        landing spot: Triton accepts the same cell."""
+        """Where FlashInfer honestly rejects head-512 on CC 12.x (fp8
+        without explicit knobs, or bf16 with the =0 escape hatch),
+        per-layer automatic fallback must have a valid landing spot:
+        Triton accepts the same cell."""
         triton_cls = AttentionBackendEnum.TRITON_ATTN.get_class()
         reasons = triton_cls.validate_configuration(
             head_size=512,
@@ -350,6 +417,26 @@ class TestFlashInferHead512SelectorHonesty:
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture
+def fake_fi_cc_family(monkeypatch):
+    """Pin the flashinfer module's current_platform to a fake whose
+    device-capability family is the given one (e.g. 120 for CC 12.x).
+    Needed because the DEFAULT-ON state of the bf16-Gemma knob is
+    CC-scoped at the runtime sites (_vo_split_factor, cudagraph gate),
+    where no DeviceCapability argument exists."""
+
+    def _set(family: int):
+        import vllm.v1.attention.backends.flashinfer as flashinfer_mod
+
+        fake = SimpleNamespace(
+            is_device_capability_family=lambda fam: fam == family,
+        )
+        monkeypatch.setattr(flashinfer_mod, "current_platform", fake)
+        return fake
+
+    return _set
+
+
 class TestVoSplitFactor:
     def test_head_le_256_never_splits(self, monkeypatch):
         monkeypatch.setenv(KNOB, "1")
@@ -357,10 +444,31 @@ class TestVoSplitFactor:
         assert _vo_split_factor(256, False) == 1
         assert _vo_split_factor(128, False) == 1
 
-    def test_bf16_head512_no_knob_no_split(self):
+    def test_bf16_head512_default_splits_on_cc12(self, fake_fi_cc_family):
+        """FLIPPED by the Amendment 3 default flip: knob unset, the
+        non-NVFP4 head-512 VO split engages by default on CC 12.x
+        devices. Was: no knob -> no split."""
+        fake_fi_cc_family(120)
+        assert _vo_split_factor(512, False) == 2
+
+    def test_bf16_head512_default_no_split_off_cc12(self, fake_fi_cc_family):
+        """CC scope of the default: knob unset, non-12.x devices keep the
+        pre-flip single-pass behavior."""
+        fake_fi_cc_family(90)
         assert _vo_split_factor(512, False) == 1
 
-    def test_bf16_head512_bf16_gemma_knob_splits(self, monkeypatch):
+    def test_bf16_head512_knob_zero_no_split(self, monkeypatch, fake_fi_cc_family):
+        """Escape hatch: =0 disables the split even on CC 12.x."""
+        fake_fi_cc_family(120)
+        monkeypatch.setenv(KNOB, "0")
+        assert _vo_split_factor(512, False) == 1
+
+    def test_bf16_head512_bf16_gemma_knob_splits(
+        self, monkeypatch, fake_fi_cc_family
+    ):
+        """Explicit =1 keeps the pre-flip opt-in semantics: enabled on
+        any CC (mocked non-12.x here to pin that)."""
+        fake_fi_cc_family(90)
         monkeypatch.setenv(KNOB, "1")
         assert _vo_split_factor(512, False) == 2
 
@@ -389,10 +497,12 @@ class TestVoSplitFactor:
 
 
 class TestEnvKnob:
-    def test_default_off(self):
+    def test_default_on(self):
+        """FLIPPED by the Amendment 3 default flip: the knob registers as
+        default-on (was: default-off / opt-in)."""
         import vllm.envs as envs
 
-        assert envs.VLLM_FLASHINFER_BF16_GEMMA is False
+        assert envs.VLLM_FLASHINFER_BF16_GEMMA is True
 
     def test_set_on(self, monkeypatch):
         import vllm.envs as envs

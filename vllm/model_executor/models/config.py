@@ -62,8 +62,9 @@ def _spark_route_gemma_bf16_to_flashinfer(
     Triton fallback there (cf. vllm-project/vllm#38887, #40677).
 
     Scope (all must hold, otherwise no-op):
-    - the knob is set (opt-in; flip-to-default is a separate proposal
-      gated on Spark serving validation),
+    - the route is not disabled (DEFAULT-ON since the Amendment 3 flip,
+      OVERNIGHT_LADDER_PLAN 2026-06-12; VLLM_FLASHINFER_BF16_GEMMA=0 is
+      the escape hatch),
     - the user has not chosen a backend explicitly,
     - the device is CC 12.x (sm_120/121: DGX Spark GB10, RTX 50xx),
     - the KV cache dtype is bf16 ("auto"/"bfloat16" — quantized-KV
@@ -79,7 +80,8 @@ def _spark_route_gemma_bf16_to_flashinfer(
     """
     import os
 
-    if os.environ.get("VLLM_FLASHINFER_BF16_GEMMA", "") in ("", "0"):
+    if os.environ.get("VLLM_FLASHINFER_BF16_GEMMA", "1") == "0":
+        # Escape hatch: =0 restores the pre-flip (upstream) routing.
         return False
     if vllm_config.attention_config.backend is not None:
         return False
@@ -108,8 +110,9 @@ def _spark_route_gemma_bf16_to_flashinfer(
         # would make backend validation fail at startup, so leave the
         # upstream route alone and say how to opt in fully.
         logger.info(
-            "VLLM_FLASHINFER_BF16_GEMMA is set but %s serves multimodal "
-            "prefix spans, which FlashInfer needs "
+            "Gemma bf16 FlashInfer routing is enabled "
+            "(VLLM_FLASHINFER_BF16_GEMMA, default-on) but %s serves "
+            "multimodal prefix spans, which FlashInfer needs "
             "VLLM_FLASHINFER_MM_PREFIX=1 for; not routing. Set that knob "
             "too (or --language-model-only for text-only serving) to "
             "retire the Triton fallback.",
@@ -120,9 +123,10 @@ def _spark_route_gemma_bf16_to_flashinfer(
 
     vllm_config.attention_config.backend = AttentionBackendEnum.FLASHINFER
     logger.info(
-        "%s with bf16 KV cache on CC %s and VLLM_FLASHINFER_BF16_GEMMA set: "
-        "forcing FLASHINFER (head sizes > 256 use the FA2 two-pass VO "
-        "split); retiring the TRITON_ATTN fallback.",
+        "%s with bf16 KV cache on CC %s and VLLM_FLASHINFER_BF16_GEMMA "
+        "enabled (default-on; set =0 to disable): forcing FLASHINFER "
+        "(head sizes > 256 use the FA2 two-pass VO split); retiring the "
+        "TRITON_ATTN fallback.",
         family,
         capability.as_version_str(),
     )
