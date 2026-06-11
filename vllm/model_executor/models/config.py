@@ -96,6 +96,26 @@ def _spark_route_gemma_bf16_to_flashinfer(
         "bfloat16",
     ):
         return False
+    model_config = vllm_config.model_config
+    if (
+        model_config is not None
+        and getattr(model_config, "is_mm_prefix_lm", False)
+        and os.environ.get("VLLM_FLASHINFER_MM_PREFIX", "") in ("", "0")
+    ):
+        # Multimodal Gemma needs bidirectional image-token spans, which
+        # FlashInfer only serves with VLLM_FLASHINFER_MM_PREFIX=1
+        # (Triton supports them natively). Forcing FLASHINFER here
+        # would make backend validation fail at startup, so leave the
+        # upstream route alone and say how to opt in fully.
+        logger.info(
+            "VLLM_FLASHINFER_BF16_GEMMA is set but %s serves multimodal "
+            "prefix spans, which FlashInfer needs "
+            "VLLM_FLASHINFER_MM_PREFIX=1 for; not routing. Set that knob "
+            "too (or --language-model-only for text-only serving) to "
+            "retire the Triton fallback.",
+            family,
+        )
+        return False
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
     vllm_config.attention_config.backend = AttentionBackendEnum.FLASHINFER

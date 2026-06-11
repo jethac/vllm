@@ -33,6 +33,7 @@ ALL_KNOBS = (
     "VLLM_FLASHINFER_VOSPLIT",
     "VLLM_NVFP4_KV_VOSPLIT",
     "VLLM_NVFP4_KV_LINEAR_V_SF",
+    "VLLM_FLASHINFER_MM_PREFIX",
 )
 
 CC12_0 = DeviceCapability(12, 0)
@@ -59,6 +60,7 @@ def _mock_vllm_config(
     skip_layers=None,
     head_dim=256,
     global_head_dim=512,
+    is_mm_prefix_lm=False,
 ):
     return SimpleNamespace(
         attention_config=SimpleNamespace(backend=backend, flash_attn_version=None),
@@ -69,7 +71,8 @@ def _mock_vllm_config(
         model_config=SimpleNamespace(
             hf_text_config=SimpleNamespace(
                 head_dim=head_dim, global_head_dim=global_head_dim
-            )
+            ),
+            is_mm_prefix_lm=is_mm_prefix_lm,
         ),
     )
 
@@ -170,6 +173,26 @@ class TestGemma4Routing:
         monkeypatch.setenv(KNOB, "1")
         cfg = _mock_vllm_config(backend=AttentionBackendEnum.TRITON_ATTN)
         assert _gemma4_route(cfg) == AttentionBackendEnum.TRITON_ATTN
+
+    def test_knob_on_mm_prefix_lm_without_mm_knob_does_not_route(
+        self, fake_cc, monkeypatch
+    ):
+        """Multimodal Gemma (mm-prefix spans live) cannot be forced onto
+        FlashInfer without VLLM_FLASHINFER_MM_PREFIX: backend validation
+        would hard-fail at startup. Upstream route must stand."""
+        fake_cc(CC12_0)
+        monkeypatch.setenv(KNOB, "1")
+        cfg = _mock_vllm_config(is_mm_prefix_lm=True)
+        assert _gemma4_route(cfg) == AttentionBackendEnum.TRITON_ATTN
+
+    def test_knob_on_mm_prefix_lm_with_mm_knob_routes(
+        self, fake_cc, monkeypatch
+    ):
+        fake_cc(CC12_0)
+        monkeypatch.setenv(KNOB, "1")
+        monkeypatch.setenv("VLLM_FLASHINFER_MM_PREFIX", "1")
+        cfg = _mock_vllm_config(is_mm_prefix_lm=True)
+        assert _gemma4_route(cfg) == AttentionBackendEnum.FLASHINFER
 
     def test_existing_vosplit_knob_still_forces_flashinfer(
         self, fake_cc, monkeypatch
