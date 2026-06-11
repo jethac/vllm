@@ -174,6 +174,75 @@ class Gemma4Config(VerifyAndUpdateConfig):
             )
 
 
+class DiffusionGemmaModelForBlockDiffusionConfig(VerifyAndUpdateConfig):
+    @classmethod
+    def verify_and_update_config(cls, vllm_config: "VllmConfig") -> None:
+        """Set up the diffusion config and defaults for DiffusionGemma.
+
+        Auto-creates DiffusionConfig from the HF config when the user
+        didn't pass ``--diffusion-config``. Diffusion sampling params are
+        read straight from generation_config.json at sampler-build time
+        (see DiffusionGemma's custom_sampler), not injected here.
+        """
+        # Inherit Gemma4's attention backend selection (FA4 on Hopper,
+        # TRITON_ATTN fallback for heterogeneous head dims).
+        Gemma4Config.verify_and_update_config(vllm_config)
+
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        attention_config = vllm_config.attention_config
+        if attention_config.backend == AttentionBackendEnum.FLASHINFER:
+            import os
+
+            if os.environ.get("VLLM_FLASHINFER_VOSPLIT", "") not in ("", "0") or (
+                os.environ.get("VLLM_NVFP4_KV_VOSPLIT", "") not in ("", "0")
+            ):
+                # spark-hijinks: per-request causal grouping in the
+                # FlashInfer backend serves DiffusionGemma's mixed
+                # causal/bidirectional batches (encoder=causal,
+                # denoise=non-causal), including the D=512 VO-split path.
+                logger.info(
+                    "DiffusionGemma on FLASHINFER via per-request causal "
+                    "grouping (spark-hijinks VO-split knobs active)."
+                )
+            else:
+                raise ValueError(
+                    "FlashInfer does not support DiffusionGemma's mixed "
+                    "causal/bidirectional attention without the "
+                    "spark-hijinks VO-split knobs. Use --attention-backend "
+                    "FLASH_ATTN or TRITON_ATTN instead."
+                )
+        if attention_config.backend is None and not attention_config.use_non_causal:
+            attention_config.use_non_causal = True
+            logger.info(
+                "DiffusionGemma uses mixed causal/bidirectional attention "
+                "within a batch; setting use_non_causal=True to exclude "
+                "FlashInfer from auto-selection."
+            )
+
+        # Auto-create DiffusionConfig from HF config if not provided.
+        if vllm_config.diffusion_config is None:
+            from vllm.config.diffusion import DiffusionConfig
+
+            hf_config = vllm_config.model_config.hf_config
+            canvas_length = getattr(hf_config, "canvas_length", 256)
+            vllm_config.diffusion_config = DiffusionConfig(
+                canvas_length=canvas_length,
+            )
+
+        # The diffusion sampler materializes [num_seqs, canvas_length, vocab]
+        # fp32 transients, so concurrency is memory-bound (>8 OOMs a single H200).
+        # Default to 8 when the user didn't pass --max-num-seqs.
+        # We can't see the original None here (the engine already filled a generic
+        # default), so use >= DEFAULT_MAX_NUM_SEQS as a proxy, (the default is much
+        # larger than any deliberate value for this model)
+        from vllm.config.scheduler import SchedulerConfig
+
+        sc = vllm_config.scheduler_config
+        if sc is not None and sc.max_num_seqs >= SchedulerConfig.DEFAULT_MAX_NUM_SEQS:
+            sc.max_num_seqs = 8
+
+
 class DeepseekV4ForCausalLMConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
