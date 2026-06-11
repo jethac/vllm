@@ -1644,12 +1644,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # heterogeneous 256/512 Gemma 4 family runs the global D=512 layers
     # through the exact two-pass FA2 VO split (no LSE merge; same
     # machinery as VLLM_FLASHINFER_VOSPLIT, scoped to this route).
-    # DEFAULT-ON since the Amendment 3 flip (OVERNIGHT_LADDER_PLAN
-    # 2026-06-12): only the value "0" disables (escape hatch). Scope is
-    # unchanged from the opt-in version: explicit --attention-backend
-    # choices, quantized-KV configs (fp8/nvfp4 routes have their own
-    # knobs), non-CC-12.x devices, and mm-prefix spans without
-    # VLLM_FLASHINFER_MM_PREFIX are never touched.
+    # DEFAULT-ON for the GEMMA 4 FAMILY ONLY since the Amendment 3 flip
+    # (OVERNIGHT_LADDER_PLAN 2026-06-12) + the 2026-06-12 scoping fix:
+    # only the value "0" disables (escape hatch). Gemma 3 requires an
+    # explicit =1 and is KNOWN NUMERICALLY WRONG on sm_120 at d256/SWA-512
+    # geometry (results/p520_gemma3_1b_serving_20260612/) — experiments
+    # only, pending the FlashInfer root-cause fix; knob-unset Gemma 3
+    # keeps upstream routing (FLASH_ATTN where supported). Scope is
+    # otherwise unchanged from the opt-in version: explicit
+    # --attention-backend choices, quantized-KV configs (fp8/nvfp4 routes
+    # have their own knobs), non-CC-12.x devices, and mm-prefix spans
+    # without VLLM_FLASHINFER_MM_PREFIX are never touched.
     "VLLM_FLASHINFER_BF16_GEMMA": lambda: os.getenv(
         "VLLM_FLASHINFER_BF16_GEMMA", "1"
     )

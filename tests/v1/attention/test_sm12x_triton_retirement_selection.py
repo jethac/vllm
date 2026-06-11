@@ -18,6 +18,16 @@ knob-unset text-only bf16 Gemma cells on CC 12.x flipped expectation;
 the mm carve-out, quantized-KV routes, explicit --attention-backend, and
 non-CC-12.x behavior are pinned unchanged below.
 
+SCOPING FIX (2026-06-12): the default flip is scoped to the GEMMA 4
+FAMILY ONLY. Gemma 3 knob-unset cells revert to pre-flip expectations
+(upstream routing, FLASH_ATTN where supported): on sm_120 at Gemma 3 1B
+geometry (d256, SWA window 512) FlashInfer is numerically wrong for
+every KV dtype (results/p520_gemma3_1b_serving_20260612/), so the
+default routing Gemma 3 onto it was a regression. Explicit =1 still
+opts Gemma 3 in for experiments (known-broken on sm_120, pending the
+FlashInfer root-cause fix). Backend-side cells (selector honesty,
+_vo_split_factor) are head>256 — Gemma 4 geometry — and unchanged.
+
 Everything runs under a mocked platform/capability; no CUDA required.
 """
 
@@ -143,6 +153,15 @@ class TestGemma4Routing:
         cfg = _mock_vllm_config()
         assert _gemma4_route(cfg) == AttentionBackendEnum.TRITON_ATTN
 
+    def test_empty_string_behaves_like_unset(self, fake_cc, monkeypatch):
+        """Post-flip knob parsing for the default-on family: only "0"
+        disables, so the empty string routes like unset (contrast the
+        Gemma 3 cell, where "" is not an explicit opt-in)."""
+        fake_cc(CC12_0)
+        monkeypatch.setenv(KNOB, "")
+        cfg = _mock_vllm_config()
+        assert _gemma4_route(cfg) == AttentionBackendEnum.FLASHINFER
+
     @pytest.mark.parametrize("capability", [CC12_0, CC12_1])
     def test_knob_on_cc12_bf16_forces_flashinfer(
         self, fake_cc, monkeypatch, capability
@@ -256,16 +275,36 @@ class TestGemma4Routing:
 
 
 class TestGemma3Routing:
-    def test_default_cc12_bf16_forces_flashinfer(self, fake_cc):
-        """FLIPPED by the Amendment 3 default flip: knob unset, text-only
-        bf16 Gemma 3 on CC 12.x now routes to FLASHINFER by default
-        (was: backend left unset for upstream priority order)."""
-        fake_cc(CC12_0)
+    @pytest.mark.parametrize("capability", [CC12_0, CC12_1])
+    def test_default_leaves_backend_unset(self, fake_cc, capability):
+        """REVERTED to the pre-flip expectation by the 2026-06-12 scoping
+        fix — WHY: on sm_120 at Gemma 3 1B geometry (d256, SWA window
+        512) FlashInfer is numerically wrong for EVERY KV dtype: FI-bf16
+        is +0.221/+1.243/+1.380 nats off an HF-reference/FLASH_ATTN pair
+        that agree to <0.001, and FI-nvfp4 emits deterministic gibberish
+        on a virgin JIT cache (results/p520_gemma3_1b_serving_20260612/
+        + ledger). The Amendment 3 default briefly routed knob-unset
+        Gemma 3 bf16 onto FlashInfer here — a regression off the correct
+        FLASH_ATTN default — so knob-unset Gemma 3 must leave the
+        backend unset for upstream priority order on ALL CC 12.x
+        (sm_121 is corroborated fine, but the default must not regress
+        sm_120). Re-flip is gated on the FlashInfer d256/SWA root cause
+        plus a green truth-referenced rerun."""
+        fake_cc(capability)
         cfg = _mock_vllm_config(global_head_dim=None)
-        assert _gemma3_route(cfg) == AttentionBackendEnum.FLASHINFER
+        assert _gemma3_route(cfg) is None
+
+    def test_empty_string_is_not_an_opt_in(self, fake_cc, monkeypatch):
+        """Scoping-fix pin: Gemma 3 routes only on an EXPLICIT enabling
+        value (pre-flip opt-in semantics); the empty string is not one."""
+        fake_cc(CC12_0)
+        monkeypatch.setenv(KNOB, "")
+        cfg = _mock_vllm_config(global_head_dim=None)
+        assert _gemma3_route(cfg) is None
 
     def test_knob_zero_leaves_backend_unset(self, fake_cc, monkeypatch):
-        """Escape hatch: =0 restores the pre-flip upstream selection."""
+        """=0 keeps upstream selection (escape hatch wording retained;
+        for Gemma 3 this now matches the knob-unset default)."""
         fake_cc(CC12_0)
         monkeypatch.setenv(KNOB, "0")
         cfg = _mock_vllm_config(global_head_dim=None)
@@ -275,6 +314,9 @@ class TestGemma3Routing:
     def test_knob_on_cc12_bf16_forces_flashinfer(
         self, fake_cc, monkeypatch, capability
     ):
+        """Explicit =1 still opts Gemma 3 in (experiments only — the
+        route is known numerically wrong on sm_120 d256/SWA-512; the
+        routing code logs a warning to that effect)."""
         fake_cc(capability)
         monkeypatch.setenv(KNOB, "1")
         cfg = _mock_vllm_config(global_head_dim=None)
