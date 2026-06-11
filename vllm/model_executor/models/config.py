@@ -96,6 +96,74 @@ class Gemma4Config(VerifyAndUpdateConfig):
                 AttentionBackendEnum,
             )
 
+        # --- spark-hijinks consumer-Blackwell (CC 12.x) routes -------------
+        # FA4's TMEM gate excludes head sizes > 128 on ALL Blackwell, so
+        # sm_120/121 falls through to the Triton force without these
+        # knob-gated FlashInfer routes (vllm#38887 / #40677). Only apply
+        # when the user has not chosen a backend explicitly.
+        if vllm_config.attention_config.backend is None:
+            import os
+
+            from vllm.v1.attention.backends.registry import (
+                AttentionBackendEnum,
+            )
+
+            cache_config = vllm_config.cache_config
+            if os.environ.get("VLLM_FLASHINFER_VOSPLIT", "") not in ("", "0"):
+                vllm_config.attention_config.backend = (
+                    AttentionBackendEnum.FLASHINFER
+                )
+                logger.info(
+                    "Gemma4 has heterogeneous head dimensions (head_dim=%d, "
+                    "global_head_dim=%d) and VLLM_FLASHINFER_VOSPLIT is "
+                    "set: forcing FLASHINFER with the FA2 VO split.",
+                    head_dim,
+                    global_head_dim,
+                )
+                return
+            mixed_kv_requested = (
+                cache_config is not None
+                and cache_config.cache_dtype != "auto"
+                and bool(cache_config.kv_cache_dtype_skip_layers)
+            )
+            if mixed_kv_requested:
+                logger.info(
+                    "Gemma4 heterogeneous head dims with per-layer mixed KV "
+                    "dtypes: keeping per-layer attention backend resolution.",
+                )
+                return
+            if (
+                cache_config is not None
+                and cache_config.cache_dtype == "nvfp4"
+                and os.environ.get("VLLM_NVFP4_KV_VOSPLIT", "") not in ("", "0")
+            ):
+                logger.info(
+                    "Gemma4 heterogeneous head dims with VLLM_NVFP4_KV_VOSPLIT: "
+                    "keeping per-layer resolution for the NVFP4 VO split.",
+                )
+                return
+        # --- end spark-hijinks routes ---------------------------------------
+
+        from vllm.v1.attention.backends.fa_utils import is_fa_version_supported
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        max_head_dim = max(head_dim, global_head_dim)
+
+        if is_fa_version_supported(4) and max_head_dim <= 512:
+            if (
+                vllm_config.attention_config.flash_attn_version is None
+                and vllm_config.attention_config.backend
+                in (None, AttentionBackendEnum.FLASH_ATTN)
+            ):
+                vllm_config.attention_config.flash_attn_version = 4
+                logger.info(
+                    "Gemma4 model has heterogeneous head dimensions "
+                    "(head_dim=%d, global_head_dim=%d). Using FA4 for "
+                    "all layers to avoid mixed FA3/FA4 penalty.",
+                    head_dim,
+                    global_head_dim,
+                )
+        elif vllm_config.attention_config.backend is None:
             vllm_config.attention_config.backend = AttentionBackendEnum.TRITON_ATTN
             logger.info(
                 "Gemma4 model has heterogeneous head dimensions "

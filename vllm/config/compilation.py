@@ -1434,10 +1434,7 @@ class CompilationConfig:
         # https://github.com/vllm-project/vllm/issues/28207#issuecomment-3504004536
         # Will be removed in the near future when we have separate cudagraph capture
         # sizes for decode and mixed prefill-decode.
-        if (
-            cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
-            and uniform_decode_query_len > 1
-        ):
+        if cudagraph_mode != CUDAGraphMode.NONE and uniform_decode_query_len > 1:
             self.adjust_cudagraph_sizes_for_spec_decode(
                 uniform_decode_query_len,
                 tensor_parallel_size,
