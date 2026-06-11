@@ -75,6 +75,64 @@ class Gemma4Config(VerifyAndUpdateConfig):
         if head_dim is None or global_head_dim is None or head_dim == global_head_dim:
             return
 
+        # --- spark-hijinks consumer-Blackwell (CC 12.x) routes -------------
+        # The FA4 unification below never engages on CC 12.x: FA4's TMEM
+        # gate excludes head sizes > 128 on ALL Blackwell, so sm_120/121
+        # would fall through to the Triton force (the vllm#38887 / #40677
+        # complaints). These knob-gated FlashInfer routes are the working
+        # alternative there; they only apply when the user has not chosen a
+        # backend explicitly.
+        if vllm_config.attention_config.backend is None:
+            import os
+
+            from vllm.v1.attention.backends.registry import (
+                AttentionBackendEnum,
+            )
+
+            cache_config = vllm_config.cache_config
+            if os.environ.get("VLLM_FLASHINFER_VOSPLIT", "") not in ("", "0"):
+                # All-dtype FA2 two-pass VO split for the >256 head-dim
+                # global layers; one backend everywhere, no mixed-backend
+                # divergence risk.
+                vllm_config.attention_config.backend = (
+                    AttentionBackendEnum.FLASHINFER
+                )
+                logger.info(
+                    "Gemma4 has heterogeneous head dimensions (head_dim=%d, "
+                    "global_head_dim=%d) and VLLM_FLASHINFER_VOSPLIT is "
+                    "set: forcing FLASHINFER with the FA2 VO split.",
+                    head_dim,
+                    global_head_dim,
+                )
+                return
+            mixed_kv_requested = (
+                cache_config is not None
+                and cache_config.cache_dtype != "auto"
+                and bool(cache_config.kv_cache_dtype_skip_layers)
+            )
+            if mixed_kv_requested:
+                # Per-layer mixed KV dtypes need per-layer backend
+                # resolution (quantized layers must keep an NVFP4-capable
+                # reader); model-wide forces break that outright.
+                logger.info(
+                    "Gemma4 heterogeneous head dims with per-layer mixed KV "
+                    "dtypes: keeping per-layer attention backend resolution.",
+                )
+                return
+            if (
+                cache_config is not None
+                and cache_config.cache_dtype == "nvfp4"
+                and os.environ.get("VLLM_NVFP4_KV_VOSPLIT", "") not in ("", "0")
+            ):
+                # Full NVFP4 KV: TRITON_ATTN cannot read the cache at all;
+                # FlashInfer handles >256 head dims via the VO split.
+                logger.info(
+                    "Gemma4 heterogeneous head dims with VLLM_NVFP4_KV_VOSPLIT: "
+                    "keeping per-layer resolution for the NVFP4 VO split.",
+                )
+                return
+        # --- end spark-hijinks routes ---------------------------------------
+
         from vllm.v1.attention.backends.fa_utils import is_fa_version_supported
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 

@@ -1587,11 +1587,9 @@ class GPUModelRunner(
 
     def _init_mrope_positions(self, req_state: CachedRequestState):
         model = self.get_model()
-        assert supports_mrope(model), "M-RoPE support is not implemented."
         assert req_state.prompt_token_ids is not None, (
             "M-RoPE requires prompt_token_ids to be available."
         )
-        mrope_model = cast(SupportsMRoPE, model)
 
         # `prompt_embeds` is a passthrough modality (no grid_thw), models'
         # M-RoPE code assumes per-feature grid info, so filter it out. The
@@ -1599,12 +1597,23 @@ class GPUModelRunner(
         mrope_features = [
             f for f in req_state.mm_features if f.modality != "prompt_embeds"
         ]
-        req_state.mrope_positions, req_state.mrope_position_delta = (
-            mrope_model.get_mrope_input_positions(
-                req_state.prompt_token_ids,
-                mrope_features,
+        if supports_mrope(model):
+            mrope_model = cast(SupportsMRoPE, model)
+            req_state.mrope_positions, req_state.mrope_position_delta = (
+                mrope_model.get_mrope_input_positions(
+                    req_state.prompt_token_ids,
+                    mrope_features,
+                )
             )
+            return
+
+        assert not mrope_features, (
+            "M-RoPE support is not implemented for multimodal requests."
         )
+        n_tokens = len(req_state.prompt_token_ids)
+        arange = torch.arange(n_tokens, dtype=torch.long)
+        req_state.mrope_positions = arange.unsqueeze(0).expand(3, -1).contiguous()
+        req_state.mrope_position_delta = 0
 
     def _init_xdrope_positions(self, req_state: CachedRequestState):
         model = self.get_model()
@@ -6908,8 +6917,10 @@ class GPUModelRunner(
                 continue
             block_size = kv_cache_group.kv_cache_spec.block_size
             block_sizes.append(block_size)
-            max_num_blocks_per_req = cdiv(
-                max_model_len, block_size * get_total_cp_world_size()
+            max_num_blocks_per_req = (
+                0
+                if block_size is None
+                else cdiv(max_model_len, block_size * get_total_cp_world_size())
             )
             if isinstance(kv_cache_group.kv_cache_spec, MambaSpec):
                 max_num_blocks_per_req = (

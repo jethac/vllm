@@ -16,6 +16,7 @@
 
 #define NVFP4_ENABLE_ELTS16 1
 #include "libtorch_stable/quantization/fp4/nvfp4_utils.cuh"
+#include <cstdlib>
 
 #include "libtorch_stable/dispatch_utils.h"
 #include "libtorch_stable/torch_utils.h"
@@ -64,7 +65,8 @@ __global__ void reshape_and_cache_nvfp4_kernel(
     const int64_t data_block_offset_stride,  // data cache stride for tokens
     const int64_t scale_block_stride,        // scale cache stride for dim 0
     const int64_t scale_head_stride,         // scale cache stride for heads
-    const int64_t scale_block_offset_stride  // scale cache stride for tokens
+    const int64_t scale_block_offset_stride,  // scale cache stride for tokens
+    const bool swizzle_v_sf  // V scales: TRT-LLM 4-token swizzle vs linear
 ) {
   using CudaType = typename CUDATypeConverter<scalar_t>::Type;
   using PVec = PackedVec<CudaType, CVT_FP4_PACK16>;
@@ -158,7 +160,7 @@ __global__ void reshape_and_cache_nvfp4_kernel(
       if (sf_out_ptr != nullptr) {
         int scale_idx = group_in_head;
         uint8_t* __restrict__ scale_dst;
-        if (kv == 0) {
+        if (kv == 0 || !swizzle_v_sf) {
           scale_dst = scale_block + head * scale_head_stride +
                       block_offset * scale_block_offset_stride + scale_idx;
         } else {
@@ -207,7 +209,15 @@ void reshape_and_cache_nvfp4_dispatch(torch::stable::Tensor& key,
 
   STD_TORCH_CHECK(head_size % 16 == 0,
                   "head_size must be divisible by 16 for NVFP4 KV cache");
-  STD_TORCH_CHECK(block_size % 4 == 0,
+  // VLLM_NVFP4_KV_LINEAR_V_SF=1 writes V scale factors linearly (same
+  // layout as K) instead of the SM100 trtllm-gen 4-token swizzle. The
+  // SM12x FA2 path reads them linearly (no in-kernel de-swizzle), which
+  // also makes head-dim-sliced V views (D=512 VO-split) layout-exact.
+  static const bool linear_v_sf = []() {
+    const char* v = std::getenv("VLLM_NVFP4_KV_LINEAR_V_SF");
+    return v != nullptr && v[0] != ' ' && v[0] != '0';
+  }();
+  STD_TORCH_CHECK(linear_v_sf || block_size % 4 == 0,
                   "block_size must be divisible by 4 for NVFP4 KV cache "
                   "swizzle");
 
@@ -272,6 +282,6 @@ void reshape_and_cache_nvfp4_dispatch(torch::stable::Tensor& key,
                 k_scale_ptr, v_scale_ptr, key.stride(0), value.stride(0),
                 num_heads, head_size, block_size, data_block_stride,
                 data_head_stride, data_block_offset_stride, scale_block_stride,
-                scale_head_stride, scale_block_offset_stride);
+                scale_head_stride, scale_block_offset_stride, !linear_v_sf);
       });
 }

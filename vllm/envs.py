@@ -91,6 +91,7 @@ if TYPE_CHECKING:
     NVCC_THREADS: str | None = None
     VLLM_USE_PRECOMPILED: bool = False
     VLLM_USE_PRECOMPILED_RUST: bool = False
+    VLLM_PRECOMPILED_SKIP_FLASH_ATTN: bool = False
     VLLM_SKIP_PRECOMPILED_VERSION_SUFFIX: bool = False
     VLLM_DOCKER_BUILD_CONTEXT: bool = False
     VLLM_KEEP_ALIVE_ON_ENGINE_DEATH: bool = False
@@ -194,6 +195,9 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
+    VLLM_NVFP4_KV_LINEAR_V_SF: bool = False
+    VLLM_NVFP4_KV_VOSPLIT: bool = False
+    VLLM_FLASHINFER_VOSPLIT: bool = False
     VLLM_XGRAMMAR_CACHE_MB: int = 0
     VLLM_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
     VLLM_ALLOW_INSECURE_SERIALIZATION: bool = False
@@ -625,6 +629,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set, vllm will use the precompiled Rust frontend binary (vllm-rs).
     "VLLM_USE_PRECOMPILED_RUST": lambda: (
         os.environ.get("VLLM_USE_PRECOMPILED_RUST", "").strip().lower() in ("1", "true")
+    ),
+    # If set, precompiled install skips bundled FlashAttention extensions.
+    "VLLM_PRECOMPILED_SKIP_FLASH_ATTN": lambda: (
+        os.environ.get("VLLM_PRECOMPILED_SKIP_FLASH_ATTN", "").strip().lower()
+        in ("1", "true")
     ),
     # If set, skip adding +precompiled suffix to version string
     "VLLM_SKIP_PRECOMPILED_VERSION_SUFFIX": lambda: bool(
@@ -1618,6 +1627,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE": lambda: int(
         os.getenv("VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE", str(394 * 1024 * 1024))
     ),
+    # NVFP4 KV cache: store V scale factors linearly (same layout as K)
+    # instead of the trtllm-gen 4-token swizzle. Required by the FA2
+    # VO-split path (head_size > 256) because the swizzle does not
+    # commute with head-dim slicing. One knob couples the C++ cache
+    # writer and the FlashInfer reader; the writer latches it at first
+    # dispatch, so set it at process start.
+    "VLLM_NVFP4_KV_LINEAR_V_SF": lambda: os.getenv(
+        "VLLM_NVFP4_KV_LINEAR_V_SF", ""
+    )
+    not in ("", "0"),
+    # Opt head_size > 256 NVFP4 KV layers into the FlashInfer FA2
+    # two-pass VO split (Gemma 4 global D=512 layers). Requires
+    # VLLM_NVFP4_KV_LINEAR_V_SF=1.
+    "VLLM_NVFP4_KV_VOSPLIT": lambda: os.getenv("VLLM_NVFP4_KV_VOSPLIT", "")
+    not in ("", "0"),
+    # Extend the FA2 two-pass VO split to ALL KV dtypes (bf16/fp16/fp8)
+    # and serve Gemma 4 entirely on FlashInfer instead of the model-wide
+    # TRITON_ATTN force (cf. vllm-project/vllm#38887, #40677).
+    "VLLM_FLASHINFER_VOSPLIT": lambda: os.getenv("VLLM_FLASHINFER_VOSPLIT", "")
+    not in ("", "0"),
     # Control the maximum number of tokens per expert supported by the
     # NVFP4 MoE CUTLASS Kernel. This value is used to create a buffer for
     # the blockscale tensor of activations NVFP4 Quantization.

@@ -133,6 +133,17 @@ def test_precompiled_install_flags_are_orthogonal() -> None:
         assert environment_variables["VLLM_USE_PRECOMPILED_RUST"]() is True
 
 
+def test_precompiled_skip_flash_attn_flag() -> None:
+    with patch.dict(os.environ, {"VLLM_PRECOMPILED_SKIP_FLASH_ATTN": "1"}):
+        assert environment_variables["VLLM_PRECOMPILED_SKIP_FLASH_ATTN"]() is True
+
+    with patch.dict(os.environ, {"VLLM_PRECOMPILED_SKIP_FLASH_ATTN": "true"}):
+        assert environment_variables["VLLM_PRECOMPILED_SKIP_FLASH_ATTN"]() is True
+
+    with patch.dict(os.environ, {}, clear=True):
+        assert environment_variables["VLLM_PRECOMPILED_SKIP_FLASH_ATTN"]() is False
+
+
 class TestEnvWithChoices:
     """Test cases for env_with_choices function."""
 

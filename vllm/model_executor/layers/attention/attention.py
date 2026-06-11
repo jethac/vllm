@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -41,6 +42,7 @@ from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
+    KVQuantMode,
     SlidingWindowSpec,
     get_kv_quant_mode,
 )
@@ -248,23 +250,45 @@ class Attention(nn.Module, AttentionLayerBase):
             and kv_cache_scheme.get("strategy") == "attn_head"
         )
 
-        # Skip quantization for specified layers
+        # Skip or override quantization for specified layers. Entries are
+        # either a bare matcher ("sliding_window", "full_attention", or a
+        # layer index), which falls matched layers back to the model dtype,
+        # or "<matcher>=<kv_cache_dtype>", which gives matched layers a
+        # different cache dtype (e.g. "full_attention=fp8_e4m3" keeps fp8 KV
+        # on global layers while the rest of the model uses the main
+        # --kv-cache-dtype). Layer-index entries win over type entries.
         if cache_config is not None and cache_config.kv_cache_dtype_skip_layers:
             from vllm.model_executor.models.utils import extract_layer_index
 
-            skip = False
-            # Check attention type
-            if (
-                sliding_window is not None
-                and "sliding_window" in cache_config.kv_cache_dtype_skip_layers
-            ):
-                skip = True
-            # Check layer index
+            def _match_skip_entry(token: str) -> str | None:
+                for entry in cache_config.kv_cache_dtype_skip_layers:
+                    key, sep, value = entry.partition("=")
+                    if key == token:
+                        return value if sep else "auto"
+                return None
+
             layer_idx = extract_layer_index(prefix)
-            if str(layer_idx) in cache_config.kv_cache_dtype_skip_layers:
-                skip = True
-            if skip:
-                kv_cache_dtype = "auto"
+            fallback = _match_skip_entry(str(layer_idx))
+            if fallback is None and sliding_window is not None:
+                fallback = _match_skip_entry("sliding_window")
+            if fallback is None and sliding_window is None:
+                # Full/global-attention layers (no sliding window). Lets
+                # hybrid-SWA models keep quantized KV on the local layers
+                # while the global layers (e.g. Gemma 4 D=512, unsupported
+                # by the FP4 attention kernels) fall back or override.
+                fallback = _match_skip_entry("full_attention")
+            if fallback is not None:
+                from typing import get_args as _get_args
+
+                from vllm.config.cache import CacheDType
+
+                if fallback != "auto" and fallback not in _get_args(CacheDType):
+                    raise ValueError(
+                        f"Invalid kv_cache_dtype override {fallback!r} in "
+                        f"kv_cache_dtype_skip_layers. Valid values: 'auto' "
+                        f"or one of {_get_args(CacheDType)}."
+                    )
+                kv_cache_dtype = fallback
                 calculate_kv_scales = False
             logger.debug(
                 "Layer %s: kv_cache_dtype=%s, sliding_window=%s",
@@ -292,6 +316,20 @@ class Attention(nn.Module, AttentionLayerBase):
         self.num_kv_heads = num_kv_heads
         self.sliding_window = sliding_window
         self.has_sink = extra_impl_args.get("sinks") is not None
+        if os.environ.get("VLLM_SPARK_KV_GEOMETRY_LOG") == "1":
+            logger.info(
+                "SPARK_GEMMA_KV_GEOMETRY layer=%s heads=%s kv_heads=%s "
+                "head_dim=%s head_dim_v=%s sliding_window=%s "
+                "kv_cache_dtype=%s torch_dtype=%s",
+                prefix,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_size,
+                self.head_size_v,
+                self.sliding_window,
+                self.kv_cache_dtype,
+                self.kv_cache_torch_dtype,
+            )
 
         # NOTE: model_config may be None during certain tests
         model_config = vllm_config.model_config
@@ -563,25 +601,64 @@ class Attention(nn.Module, AttentionLayerBase):
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.attn_backend
 
+    def _maybe_log_kv_cache_spec(self, spec: KVCacheSpec) -> None:
+        if os.environ.get("VLLM_SPARK_KV_GEOMETRY_LOG") != "1":
+            return
+        kv_quant_mode = getattr(spec, "kv_quant_mode", None)
+        page_size_bytes = getattr(spec, "page_size_bytes", None)
+        block_size = getattr(spec, "block_size", None)
+        bytes_per_token = (
+            page_size_bytes / block_size
+            if page_size_bytes is not None and block_size
+            else None
+        )
+        logger.info(
+            "SPARK_GEMMA_KV_SPEC layer=%s spec=%s block_size=%s "
+            "num_kv_heads=%s head_size=%s head_size_v=%s dtype=%s "
+            "kv_quant_mode=%s sliding_window=%s real_page_size_bytes=%s "
+            "page_size_bytes=%s bytes_per_token=%s",
+            self.layer_name,
+            type(spec).__name__,
+            block_size,
+            getattr(spec, "num_kv_heads", None),
+            getattr(spec, "head_size", None),
+            getattr(spec, "head_size_v", None),
+            getattr(spec, "dtype", None),
+            getattr(kv_quant_mode, "name", kv_quant_mode),
+            getattr(spec, "sliding_window", None),
+            getattr(spec, "real_page_size_bytes", None),
+            page_size_bytes,
+            f"{bytes_per_token:.3f}" if bytes_per_token is not None else None,
+        )
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         # Block size may get updated after model loading, refresh it
         block_size = vllm_config.cache_config.block_size
         # Should not be called for enc-dec or encoder-only attention.
         assert self.attn_type == AttentionType.DECODER
         quant_mode = get_kv_quant_mode(self.kv_cache_dtype)
+        # Record the resolved dtype string for quantized layers so backends
+        # can dispatch per layer group instead of assuming the global
+        # cache_config.cache_dtype (which mixed per-layer KV dtypes break).
+        cache_dtype_str = (
+            self.kv_cache_dtype if quant_mode != KVQuantMode.NONE else None
+        )
         if self.sliding_window is not None:
             assert not vllm_config.model_config.use_mla, (
                 "MLA is not supported for slidingwindow"
             )
-            return SlidingWindowSpec(
+            spec = SlidingWindowSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_size,
                 head_size_v=self.head_size_v,
                 dtype=self.kv_cache_torch_dtype,
                 kv_quant_mode=quant_mode,
+                cache_dtype_str=cache_dtype_str,
                 sliding_window=self.sliding_window,
             )
+            self._maybe_log_kv_cache_spec(spec)
+            return spec
         elif self.kv_cache_dtype.startswith("turboquant_"):
             from vllm.model_executor.layers.quantization.turboquant.config import (
                 TurboQuantConfig,
@@ -591,23 +668,29 @@ class Attention(nn.Module, AttentionLayerBase):
             tq_config = TurboQuantConfig.from_cache_dtype(
                 self.kv_cache_dtype, self.head_size
             )
-            return TQFullAttentionSpec(
+            spec = TQFullAttentionSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_size,
                 head_size_v=self.head_size,
                 dtype=self.kv_cache_torch_dtype,
+                cache_dtype_str=self.kv_cache_dtype,
                 tq_slot_size=tq_config.slot_size_aligned,
             )
+            self._maybe_log_kv_cache_spec(spec)
+            return spec
         else:
-            return FullAttentionSpec(
+            spec = FullAttentionSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_size,
                 head_size_v=self.head_size_v,
                 dtype=self.kv_cache_torch_dtype,
                 kv_quant_mode=quant_mode,
+                cache_dtype_str=cache_dtype_str,
             )
+            self._maybe_log_kv_cache_spec(spec)
+            return spec
 
 
 def maybe_calc_kv_scales(

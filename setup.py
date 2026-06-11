@@ -751,6 +751,10 @@ class precompiled_wheel_utils:
             with zipfile.ZipFile(wheel_path) as wheel:
                 exact_members = set()
                 if extract_extensions:
+                    flash_attn_extensions = {
+                        "vllm/vllm_flash_attn/_vllm_fa2_C.abi3.so",
+                        "vllm/vllm_flash_attn/_vllm_fa3_C.abi3.so",
+                    }
                     exact_members.update(
                         {
                             "vllm/_C.abi3.so",
@@ -759,14 +763,19 @@ class precompiled_wheel_utils:
                             "vllm/_flashmla_C.abi3.so",
                             "vllm/_flashmla_extension_C.abi3.so",
                             "vllm/_sparse_flashmla_C.abi3.so",
-                            "vllm/vllm_flash_attn/_vllm_fa2_C.abi3.so",
-                            "vllm/vllm_flash_attn/_vllm_fa3_C.abi3.so",
                             "vllm/cumem_allocator.abi3.so",
                             "vllm/spinloop.abi3.so",
                             # ROCm-specific libraries
                             "vllm/_rocm_C.abi3.so",
                         }
                     )
+                    if envs.VLLM_PRECOMPILED_SKIP_FLASH_ATTN:
+                        print(
+                            "Skipping bundled FlashAttention extensions from "
+                            "precompiled wheel."
+                        )
+                    else:
+                        exact_members.update(flash_attn_extensions)
                 if extract_rust_frontend:
                     exact_members.add("vllm/vllm-rs")
 
