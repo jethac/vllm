@@ -664,7 +664,15 @@ def _vllm_flashinfer_bf16_gemma_requested() -> bool:
     _vllm_flashinfer_bf16_gemma_vo_split_enabled() and the kv-dtype
     check in supports_combination; explicitly setting =1 keeps the
     pre-flip opt-in semantics (any CC at the split level, fp8 dense KV
-    included)."""
+    included).
+
+    Routing-side note (2026-06-12 scoping fix): the model-config routing
+    applies the default to the GEMMA 4 FAMILY ONLY; Gemma 3 needs an
+    explicit =1 and is known numerically wrong on sm_120 at d256/SWA-512
+    geometry (see _spark_route_gemma_bf16_to_flashinfer in
+    vllm/model_executor/models/config.py). Backend-side, everything here
+    concerns head_size > 256 (Gemma 4 geometry), so this helper's
+    default-on semantics are unchanged."""
     value = os.environ.get("VLLM_FLASHINFER_BF16_GEMMA", "1")
     return value != "0"
 
