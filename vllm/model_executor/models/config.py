@@ -54,6 +54,69 @@ class Gemma3TextModelConfig(VerifyAndUpdateConfig):
         hf_config.is_causal = not hf_config.use_bidirectional_attention
 
 
+def _spark_route_gemma_bf16_to_flashinfer(
+    vllm_config: "VllmConfig", family: str
+) -> bool:
+    """spark-hijinks: VLLM_FLASHINFER_BF16_GEMMA routes Gemma-family bf16-KV
+    configs on consumer Blackwell (CC 12.x) to FlashInfer, retiring the
+    Triton fallback there (cf. vllm-project/vllm#38887, #40677).
+
+    Scope (all must hold, otherwise no-op):
+    - the knob is set (opt-in; flip-to-default is a separate proposal
+      gated on Spark serving validation),
+    - the user has not chosen a backend explicitly,
+    - the device is CC 12.x (sm_120/121: DGX Spark GB10, RTX 50xx),
+    - the KV cache dtype is bf16 ("auto"/"bfloat16" — quantized-KV
+      configs keep their own routes/knobs).
+
+    Uniform-256 models (Gemma 3) run plain FlashInfer FA2; heterogeneous
+    256/512 models (Gemma 4) run global D=512 layers through the exact
+    FA2 two-pass VO split, which this knob enables on the backend side
+    (see _vllm_flashinfer_bf16_gemma_requested in
+    vllm/v1/attention/backends/flashinfer.py).
+
+    Returns True iff the backend was forced to FLASHINFER.
+    """
+    import os
+
+    if os.environ.get("VLLM_FLASHINFER_BF16_GEMMA", "") in ("", "0"):
+        return False
+    if vllm_config.attention_config.backend is not None:
+        return False
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda():
+        return False
+    capability = current_platform.get_device_capability()
+    if capability is None or capability.major != 12:
+        return False
+    cache_config = vllm_config.cache_config
+    if cache_config is not None and cache_config.cache_dtype not in (
+        "auto",
+        "bfloat16",
+    ):
+        return False
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    vllm_config.attention_config.backend = AttentionBackendEnum.FLASHINFER
+    logger.info(
+        "%s with bf16 KV cache on CC %s and VLLM_FLASHINFER_BF16_GEMMA set: "
+        "forcing FLASHINFER (head sizes > 256 use the FA2 two-pass VO "
+        "split); retiring the TRITON_ATTN fallback.",
+        family,
+        capability.as_version_str(),
+    )
+    return True
+
+
+class Gemma3Config(VerifyAndUpdateConfig):
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        """Gemma 3 (uniform head_dim 256) needs no head-size handling;
+        the only route is the campaign CC 12.x bf16 FlashInfer knob."""
+        _spark_route_gemma_bf16_to_flashinfer(vllm_config, "Gemma3")
+
+
 class Gemma4Config(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
@@ -71,6 +134,15 @@ class Gemma4Config(VerifyAndUpdateConfig):
         hf_text_config = vllm_config.model_config.hf_text_config
         head_dim = getattr(hf_text_config, "head_dim", None)
         global_head_dim = getattr(hf_text_config, "global_head_dim", None)
+
+        # spark-hijinks: CC 12.x bf16 FlashInfer route (Triton retirement).
+        # Checked before the uniform-head early return so that
+        # uniform-head Gemma 4 variants route too; for heterogeneous
+        # heads it supersedes every force below (the backend is no
+        # longer None). Global D=512 layers run the FA2 two-pass VO
+        # split, which VLLM_FLASHINFER_BF16_GEMMA enables backend-side.
+        if _spark_route_gemma_bf16_to_flashinfer(vllm_config, "Gemma4"):
+            return
 
         if head_dim is None or global_head_dim is None or head_dim == global_head_dim:
             return
@@ -652,6 +724,8 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "Ernie4_5_VLMoeForConditionalGeneration": Ernie4_5_VLMoeForConditionalGenerationConfig,  # noqa: E501
     "FalconMambaForCausalLM": MambaModelConfig,
     "Gemma3TextModel": Gemma3TextModelConfig,
+    "Gemma3ForCausalLM": Gemma3Config,
+    "Gemma3ForConditionalGeneration": Gemma3Config,
     "Gemma4ForCausalLM": Gemma4Config,
     "Gemma4ForConditionalGeneration": Gemma4Config,
     "Gemma4UnifiedForConditionalGeneration": Gemma4Config,

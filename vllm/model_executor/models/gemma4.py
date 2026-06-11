@@ -491,10 +491,16 @@ class Gemma4Attention(nn.Module):
 
         # Per-layer mixed KV (quantized cache_dtype + skip-layers fallback):
         # global D>256 layers must be pinned to a head-size-capable backend.
-        # The selector's validate_configuration accepts head_size=512 for
-        # FlashInfer, but its FA2 kernel rejects it at run time (trait guard
-        # in prefill.cuh, dtype-independent — probed on GB10), so automatic
-        # per-layer fallback does not happen and the pin must be explicit.
+        # History: the selector's validate_configuration used to accept
+        # head_size=512 for FlashInfer while its FA2 kernel rejects it at
+        # run time (trait guard in prefill.cuh, dtype-independent — probed
+        # on GB10), so automatic per-layer fallback did not happen and the
+        # pin had to be explicit. FlashInferBackend.supports_combination
+        # now rejects head_size > 256 on CC 12.x unless a VO-split knob is
+        # set, so the automatic fallback lands on Triton there too; the
+        # pin stays as the deterministic choice (and for non-12.x CCs,
+        # where the selector still over-promises head-512 — see the
+        # campaign's draft upstream issue).
         # Full-NVFP4 alternative (no skip layers): VLLM_NVFP4_KV_VOSPLIT=1
         # keeps these layers on FlashInfer via the two-pass VO split;
         # mixed_kv_requested is then False, so no pin happens here.

@@ -648,6 +648,19 @@ def _vllm_flashinfer_vosplit_requested() -> bool:
     return value not in ("", "0")
 
 
+def _vllm_flashinfer_bf16_gemma_requested() -> bool:
+    """VLLM_FLASHINFER_BF16_GEMMA=1 routes Gemma-family bf16-KV configs on
+    CC 12.x to FlashInfer (see the Gemma3/Gemma4 routing in
+    vllm/model_executor/models/config.py), retiring the Triton fallback
+    there. On the backend side it enables the FA2 two-pass VO split for
+    head_size > 256 non-NVFP4 layers, same as VLLM_FLASHINFER_VOSPLIT:
+    the split is dtype-independent and exact, and enabling it is strictly
+    better than letting the FA2 trait guard reject the launch at
+    runtime."""
+    value = os.environ.get("VLLM_FLASHINFER_BF16_GEMMA", "")
+    return value not in ("", "0")
+
+
 def _vo_split_factor(head_size: int, is_fa2_nvfp4: bool) -> int:
     """Number of VO passes for the FlashInfer FA2 path.
 
@@ -681,8 +694,8 @@ def _vo_split_factor(head_size: int, is_fa2_nvfp4: bool) -> int:
                 "group across the full scale row and cannot be sliced "
                 "along the head dimension."
             )
-    elif not vosplit_all_dtypes:
-        # Dense/fp8 KV: without the knob, keep the pre-existing behavior
+    elif not (vosplit_all_dtypes or _vllm_flashinfer_bf16_gemma_requested()):
+        # Dense/fp8 KV: without a knob, keep the pre-existing behavior
         # (backend selection / the Gemma4 TRITON_ATTN force handles >256).
         return 1
     split = -(-head_size // 256)
@@ -1105,6 +1118,71 @@ class FlashInferBackend(AttentionBackend):
         return capability >= DeviceCapability(7, 5) and capability <= DeviceCapability(
             12, 1
         )
+
+    @classmethod
+    def supports_combination(
+        cls,
+        head_size: int,
+        dtype: torch.dtype,
+        kv_cache_dtype: "CacheDType | None",
+        block_size: int | None,
+        use_mla: bool,
+        has_sink: bool,
+        use_sparse: bool,
+        use_mm_prefix: bool,
+        device_capability: DeviceCapability,
+    ) -> str | None:
+        """Make selector truth match kernel truth for head_size > 256 on
+        CC 12.x (the banked selector-vs-kernel head-512 discrepancy).
+
+        get_supported_head_sizes() lists 512 because FlashInfer's
+        DISPATCH_HEAD_DIM has a case for it, but the generated FA2 paged
+        kernel rejects HEAD_DIM_VO > 256 at runtime via
+        KernelTraits::IsInvalid() (the VO accumulator fragment budget;
+        prefill.cuh, dtype-independent — probed on GB10). On CC 12.x FA2
+        is the only FlashInfer path (no TRTLLM kernels), so without a
+        VO-split knob a head-512 selection is guaranteed to fail below
+        the routing layer. Rejecting it here makes the per-layer
+        automatic fallback (e.g. global D=512 layers -> Triton under
+        mixed-KV) actually work instead of over-promising
+        (cf. vllm-project/vllm#38887, #40677).
+
+        Scoped to CC major == 12: on SM100 FlashInfer may route to
+        TRTLLM kernels whose head-512 support we have not probed, so
+        upstream behavior there is left untouched (the over-promise is
+        documented in the campaign's draft upstream issue instead).
+        """
+        if device_capability.major != 12 or head_size <= 256:
+            return None
+        vosplit_all = _vllm_flashinfer_vosplit_requested()
+        if kv_cache_dtype == "nvfp4":
+            if not (vosplit_all or _vllm_nvfp4_kv_vosplit_requested()):
+                return (
+                    f"head_size {head_size} > 256 with NVFP4 KV on CC 12.x "
+                    "needs the FA2 two-pass VO split "
+                    "(VLLM_NVFP4_KV_VOSPLIT=1 + VLLM_NVFP4_KV_LINEAR_V_SF=1); "
+                    "the FA2 kernel trait guard rejects HEAD_DIM_VO > 256"
+                )
+            if not _vllm_nvfp4_linear_v_sf():
+                return (
+                    "the NVFP4 VO split requires VLLM_NVFP4_KV_LINEAR_V_SF=1 "
+                    "(swizzled V scale factors cannot be sliced along the "
+                    "head dim)"
+                )
+        elif not (vosplit_all or _vllm_flashinfer_bf16_gemma_requested()):
+            return (
+                f"head_size {head_size} > 256 on CC 12.x needs the FA2 "
+                "two-pass VO split (VLLM_FLASHINFER_VOSPLIT=1 or, for "
+                "Gemma bf16 routing, VLLM_FLASHINFER_BF16_GEMMA=1); the "
+                "FA2 kernel trait guard rejects HEAD_DIM_VO > 256"
+            )
+        split = -(-head_size // 256)
+        if head_size % split != 0:
+            return (
+                f"head_size {head_size} does not divide into equal "
+                "<=256-wide VO-split chunks"
+            )
+        return None
 
     @classmethod
     def supports_mm_prefix(cls) -> bool:
@@ -1562,6 +1640,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 continue
             if spec.head_size > 256 and (
                 _vllm_flashinfer_vosplit_requested()
+                or _vllm_flashinfer_bf16_gemma_requested()
                 or (
                     spec.kv_quant_mode != KVQuantMode.NONE
                     and current_platform.is_device_capability_family(120)

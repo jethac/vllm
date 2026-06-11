@@ -198,6 +198,7 @@ if TYPE_CHECKING:
     VLLM_NVFP4_KV_LINEAR_V_SF: bool = False
     VLLM_NVFP4_KV_VOSPLIT: bool = False
     VLLM_FLASHINFER_VOSPLIT: bool = False
+    VLLM_FLASHINFER_BF16_GEMMA: bool = False
     VLLM_FLASHINFER_MM_PREFIX: bool = False
     VLLM_XGRAMMAR_CACHE_MB: int = 0
     VLLM_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
@@ -1647,6 +1648,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and serve Gemma 4 entirely on FlashInfer instead of the model-wide
     # TRITON_ATTN force (cf. vllm-project/vllm#38887, #40677).
     "VLLM_FLASHINFER_VOSPLIT": lambda: os.getenv("VLLM_FLASHINFER_VOSPLIT", "")
+    not in ("", "0"),
+    # Route Gemma-family bf16 ("auto"/bfloat16 KV) configs on consumer
+    # Blackwell (CC 12.x) to the FlashInfer backend, retiring the Triton
+    # fallback there: uniform-256 models (Gemma 3) run plain FA2, and the
+    # heterogeneous 256/512 Gemma 4 family runs the global D=512 layers
+    # through the exact two-pass FA2 VO split (no LSE merge; same
+    # machinery as VLLM_FLASHINFER_VOSPLIT, scoped to this route).
+    # Opt-in for now; flip-to-default is a separate proposal gated on
+    # Spark serving validation. Explicit --attention-backend choices and
+    # quantized-KV configs (fp8/nvfp4 routes have their own knobs) are
+    # never overridden.
+    "VLLM_FLASHINFER_BF16_GEMMA": lambda: os.getenv(
+        "VLLM_FLASHINFER_BF16_GEMMA", ""
+    )
     not in ("", "0"),
     # Let the FlashInfer backend serve mm-prefix LMs (Gemma 3 / Gemma 4
     # multimodal): image-token spans attend bidirectionally via FA2
