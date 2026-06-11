@@ -55,16 +55,29 @@ class Gemma3TextModelConfig(VerifyAndUpdateConfig):
 
 
 def _spark_route_gemma_bf16_to_flashinfer(
-    vllm_config: "VllmConfig", family: str
+    vllm_config: "VllmConfig", family: str, default_on: bool
 ) -> bool:
     """spark-hijinks: VLLM_FLASHINFER_BF16_GEMMA routes Gemma-family bf16-KV
     configs on consumer Blackwell (CC 12.x) to FlashInfer, retiring the
     Triton fallback there (cf. vllm-project/vllm#38887, #40677).
 
     Scope (all must hold, otherwise no-op):
-    - the route is not disabled (DEFAULT-ON since the Amendment 3 flip,
-      OVERNIGHT_LADDER_PLAN 2026-06-12; VLLM_FLASHINFER_BF16_GEMMA=0 is
-      the escape hatch),
+    - the route is enabled for the family:
+      * Gemma 4 (``default_on=True``): DEFAULT-ON since the Amendment 3
+        flip (OVERNIGHT_LADDER_PLAN 2026-06-12);
+        VLLM_FLASHINFER_BF16_GEMMA=0 is the escape hatch.
+      * Gemma 3 (``default_on=False``): explicit =1 ONLY. The 2026-06-12
+        flip briefly included Gemma 3, but on sm_120 at Gemma 3 1B
+        geometry (head_dim 256, SWA window 512) FlashInfer is
+        numerically wrong for every KV dtype — FI-bf16 is +0.221 to
+        +1.380 nats off an HF-reference/FLASH_ATTN pair that agree to
+        <0.001; FI-nvfp4 emits deterministic gibberish on a virgin JIT
+        cache (results/p520_gemma3_1b_serving_20260612/). sm_121 is
+        corroborated fine, but the default must not regress sm_120, so
+        Gemma 3 keeps upstream routing (FLASH_ATTN where supported)
+        unless explicitly opted in for experiments. Re-flip is gated on
+        the FlashInfer d256/SWA root cause plus a green truth-referenced
+        rerun.
     - the user has not chosen a backend explicitly,
     - the device is CC 12.x (sm_120/121: DGX Spark GB10, RTX 50xx),
     - the KV cache dtype is bf16 ("auto"/"bfloat16" — quantized-KV
@@ -80,8 +93,13 @@ def _spark_route_gemma_bf16_to_flashinfer(
     """
     import os
 
-    if os.environ.get("VLLM_FLASHINFER_BF16_GEMMA", "1") == "0":
+    raw = os.environ.get("VLLM_FLASHINFER_BF16_GEMMA")
+    if raw == "0":
         # Escape hatch: =0 restores the pre-flip (upstream) routing.
+        return False
+    if not default_on and raw in (None, ""):
+        # Gemma 3: the default never engages (sm_120 numerical
+        # regression, see docstring); only an explicit opt-in routes.
         return False
     if vllm_config.attention_config.backend is not None:
         return False
@@ -111,7 +129,8 @@ def _spark_route_gemma_bf16_to_flashinfer(
         # upstream route alone and say how to opt in fully.
         logger.info(
             "Gemma bf16 FlashInfer routing is enabled "
-            "(VLLM_FLASHINFER_BF16_GEMMA, default-on) but %s serves "
+            "(VLLM_FLASHINFER_BF16_GEMMA, default-on for Gemma 4 family) "
+            "but %s serves "
             "multimodal prefix spans, which FlashInfer needs "
             "VLLM_FLASHINFER_MM_PREFIX=1 for; not routing. Set that knob "
             "too (or --language-model-only for text-only serving) to "
@@ -124,12 +143,24 @@ def _spark_route_gemma_bf16_to_flashinfer(
     vllm_config.attention_config.backend = AttentionBackendEnum.FLASHINFER
     logger.info(
         "%s with bf16 KV cache on CC %s and VLLM_FLASHINFER_BF16_GEMMA "
-        "enabled (default-on; set =0 to disable): forcing FLASHINFER "
+        "enabled (%s): forcing FLASHINFER "
         "(head sizes > 256 use the FA2 two-pass VO split); retiring the "
         "TRITON_ATTN fallback.",
         family,
         capability.as_version_str(),
+        "default-on; set =0 to disable"
+        if default_on
+        else "explicit opt-in",
     )
+    if not default_on:
+        logger.warning(
+            "Explicit VLLM_FLASHINFER_BF16_GEMMA opt-in for %s: FlashInfer "
+            "is KNOWN NUMERICALLY WRONG on sm_120 at Gemma 3 1B geometry "
+            "(head_dim 256, SWA window 512) for every KV dtype "
+            "(results/p520_gemma3_1b_serving_20260612/); this opt-in is for "
+            "experiments only, pending the FlashInfer root-cause fix.",
+            family,
+        )
     return True
 
 
@@ -137,8 +168,15 @@ class Gemma3Config(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
         """Gemma 3 (uniform head_dim 256) needs no head-size handling;
-        the only route is the campaign CC 12.x bf16 FlashInfer knob."""
-        _spark_route_gemma_bf16_to_flashinfer(vllm_config, "Gemma3")
+        the only route is the campaign CC 12.x bf16 FlashInfer knob —
+        EXPLICIT opt-in only (default_on=False): the default flip was
+        scoped back to Gemma 4 on 2026-06-12 because FlashInfer is
+        numerically wrong on sm_120 at this geometry (d256, SWA 512;
+        see _spark_route_gemma_bf16_to_flashinfer). Knob-unset Gemma 3
+        keeps upstream routing (FLASH_ATTN where supported)."""
+        _spark_route_gemma_bf16_to_flashinfer(
+            vllm_config, "Gemma3", default_on=False
+        )
 
 
 class Gemma4Config(VerifyAndUpdateConfig):
@@ -172,7 +210,9 @@ class Gemma4Config(VerifyAndUpdateConfig):
         # heads it supersedes every force below (the backend is no
         # longer None). Global D=512 layers run the FA2 two-pass VO
         # split, which VLLM_FLASHINFER_BF16_GEMMA enables backend-side.
-        if _spark_route_gemma_bf16_to_flashinfer(vllm_config, "Gemma4"):
+        if _spark_route_gemma_bf16_to_flashinfer(
+            vllm_config, "Gemma4", default_on=True
+        ):
             return
 
         if head_dim is None or global_head_dim is None or head_dim == global_head_dim:
