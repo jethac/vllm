@@ -649,16 +649,50 @@ def _vllm_flashinfer_vosplit_requested() -> bool:
 
 
 def _vllm_flashinfer_bf16_gemma_requested() -> bool:
-    """VLLM_FLASHINFER_BF16_GEMMA=1 routes Gemma-family bf16-KV configs on
+    """VLLM_FLASHINFER_BF16_GEMMA routes Gemma-family bf16-KV configs on
     CC 12.x to FlashInfer (see the Gemma3/Gemma4 routing in
     vllm/model_executor/models/config.py), retiring the Triton fallback
     there. On the backend side it enables the FA2 two-pass VO split for
     head_size > 256 non-NVFP4 layers, same as VLLM_FLASHINFER_VOSPLIT:
     the split is dtype-independent and exact, and enabling it is strictly
     better than letting the FA2 trait guard reject the launch at
-    runtime."""
-    value = os.environ.get("VLLM_FLASHINFER_BF16_GEMMA", "")
-    return value not in ("", "0")
+    runtime.
+
+    DEFAULT-ON since the Amendment 3 flip (OVERNIGHT_LADDER_PLAN
+    2026-06-12): only "0" disables (escape hatch). The default's effect
+    is scoped to CC 12.x bf16 cells via
+    _vllm_flashinfer_bf16_gemma_vo_split_enabled() and the kv-dtype
+    check in supports_combination; explicitly setting =1 keeps the
+    pre-flip opt-in semantics (any CC at the split level, fp8 dense KV
+    included)."""
+    value = os.environ.get("VLLM_FLASHINFER_BF16_GEMMA", "1")
+    return value != "0"
+
+
+def _vllm_flashinfer_bf16_gemma_explicit() -> bool:
+    """True only when the user explicitly set VLLM_FLASHINFER_BF16_GEMMA
+    to an enabling value (the pre-flip opt-in). Distinguished from the
+    default-on state so the flip changes ONLY knob-unset text-only bf16
+    Gemma behavior on CC 12.x: explicit opt-in keeps its pre-flip scope
+    (e.g. fp8-KV head-512 acceptance in supports_combination), while the
+    default never widens beyond bf16/auto KV on CC 12.x."""
+    return os.environ.get("VLLM_FLASHINFER_BF16_GEMMA", "") not in ("", "0")
+
+
+def _vllm_flashinfer_bf16_gemma_vo_split_enabled() -> bool:
+    """VO-split enablement contributed by the bf16-Gemma knob at runtime
+    sites (where no DeviceCapability argument is available):
+    - explicit =1: enabled on any CC (pre-flip opt-in semantics,
+      unchanged);
+    - unset (default-on): enabled only on CC 12.x devices, so the
+      Amendment 3 flip cannot change non-12.x behavior;
+    - =0: disabled (escape hatch)."""
+    if _vllm_flashinfer_bf16_gemma_explicit():
+        return True
+    return (
+        _vllm_flashinfer_bf16_gemma_requested()
+        and current_platform.is_device_capability_family(120)
+    )
 
 
 def _vo_split_factor(head_size: int, is_fa2_nvfp4: bool) -> int:
@@ -694,9 +728,12 @@ def _vo_split_factor(head_size: int, is_fa2_nvfp4: bool) -> int:
                 "group across the full scale row and cannot be sliced "
                 "along the head dimension."
             )
-    elif not (vosplit_all_dtypes or _vllm_flashinfer_bf16_gemma_requested()):
-        # Dense/fp8 KV: without a knob, keep the pre-existing behavior
-        # (backend selection / the Gemma4 TRITON_ATTN force handles >256).
+    elif not (
+        vosplit_all_dtypes or _vllm_flashinfer_bf16_gemma_vo_split_enabled()
+    ):
+        # Dense/fp8 KV: without a knob (and outside the CC 12.x bf16-Gemma
+        # default), keep the pre-existing behavior (backend selection /
+        # the Gemma4 TRITON_ATTN force handles >256).
         return 1
     split = -(-head_size // 256)
     if head_size % split != 0 or (
@@ -1169,13 +1206,25 @@ class FlashInferBackend(AttentionBackend):
                     "(swizzled V scale factors cannot be sliced along the "
                     "head dim)"
                 )
-        elif not (vosplit_all or _vllm_flashinfer_bf16_gemma_requested()):
-            return (
-                f"head_size {head_size} > 256 on CC 12.x needs the FA2 "
-                "two-pass VO split (VLLM_FLASHINFER_VOSPLIT=1 or, for "
-                "Gemma bf16 routing, VLLM_FLASHINFER_BF16_GEMMA=1); the "
-                "FA2 kernel trait guard rejects HEAD_DIM_VO > 256"
+        else:
+            # The bf16-Gemma knob is default-on (Amendment 3 flip), but
+            # the DEFAULT only vouches for bf16/"auto" KV — exactly the
+            # cells the Gemma routing sends here. Explicitly setting =1
+            # keeps the pre-flip opt-in scope (fp8 dense KV included);
+            # =0 disables and restores the pre-knob rejection.
+            bf16_gemma_allows = _vllm_flashinfer_bf16_gemma_explicit() or (
+                _vllm_flashinfer_bf16_gemma_requested()
+                and kv_cache_dtype in (None, "auto", "bfloat16")
             )
+            if not (vosplit_all or bf16_gemma_allows):
+                return (
+                    f"head_size {head_size} > 256 on CC 12.x needs the FA2 "
+                    "two-pass VO split (VLLM_FLASHINFER_VOSPLIT=1, or "
+                    "VLLM_FLASHINFER_BF16_GEMMA: default-on for "
+                    "bf16/'auto' KV, =1 explicitly for other dense KV "
+                    "dtypes, =0 disables); the FA2 kernel trait guard "
+                    "rejects HEAD_DIM_VO > 256"
+                )
         split = -(-head_size // 256)
         if head_size % split != 0:
             return (
@@ -1640,7 +1689,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 continue
             if spec.head_size > 256 and (
                 _vllm_flashinfer_vosplit_requested()
-                or _vllm_flashinfer_bf16_gemma_requested()
+                or _vllm_flashinfer_bf16_gemma_vo_split_enabled()
                 or (
                     spec.kv_quant_mode != KVQuantMode.NONE
                     and current_platform.is_device_capability_family(120)

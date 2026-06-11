@@ -198,7 +198,7 @@ if TYPE_CHECKING:
     VLLM_NVFP4_KV_LINEAR_V_SF: bool = False
     VLLM_NVFP4_KV_VOSPLIT: bool = False
     VLLM_FLASHINFER_VOSPLIT: bool = False
-    VLLM_FLASHINFER_BF16_GEMMA: bool = False
+    VLLM_FLASHINFER_BF16_GEMMA: bool = True
     VLLM_FLASHINFER_MM_PREFIX: bool = False
     VLLM_XGRAMMAR_CACHE_MB: int = 0
     VLLM_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
@@ -1655,14 +1655,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # heterogeneous 256/512 Gemma 4 family runs the global D=512 layers
     # through the exact two-pass FA2 VO split (no LSE merge; same
     # machinery as VLLM_FLASHINFER_VOSPLIT, scoped to this route).
-    # Opt-in for now; flip-to-default is a separate proposal gated on
-    # Spark serving validation. Explicit --attention-backend choices and
-    # quantized-KV configs (fp8/nvfp4 routes have their own knobs) are
-    # never overridden.
+    # DEFAULT-ON since the Amendment 3 flip (OVERNIGHT_LADDER_PLAN
+    # 2026-06-12): only the value "0" disables (escape hatch). Scope is
+    # unchanged from the opt-in version: explicit --attention-backend
+    # choices, quantized-KV configs (fp8/nvfp4 routes have their own
+    # knobs), non-CC-12.x devices, and mm-prefix spans without
+    # VLLM_FLASHINFER_MM_PREFIX are never touched.
     "VLLM_FLASHINFER_BF16_GEMMA": lambda: os.getenv(
-        "VLLM_FLASHINFER_BF16_GEMMA", ""
+        "VLLM_FLASHINFER_BF16_GEMMA", "1"
     )
-    not in ("", "0"),
+    != "0",
     # Let the FlashInfer backend serve mm-prefix LMs (Gemma 3 / Gemma 4
     # multimodal): image-token spans attend bidirectionally via FA2
     # packed custom masks on a second prefill wrapper; text requests
