@@ -198,6 +198,7 @@ if TYPE_CHECKING:
     VLLM_NVFP4_KV_LINEAR_V_SF: bool = False
     VLLM_NVFP4_KV_VOSPLIT: bool = False
     VLLM_FLASHINFER_VOSPLIT: bool = False
+    VLLM_FLASHINFER_MM_PREFIX: bool = False
     VLLM_XGRAMMAR_CACHE_MB: int = 0
     VLLM_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
     VLLM_ALLOW_INSECURE_SERIALIZATION: bool = False
@@ -1646,6 +1647,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and serve Gemma 4 entirely on FlashInfer instead of the model-wide
     # TRITON_ATTN force (cf. vllm-project/vllm#38887, #40677).
     "VLLM_FLASHINFER_VOSPLIT": lambda: os.getenv("VLLM_FLASHINFER_VOSPLIT", "")
+    not in ("", "0"),
+    # Let the FlashInfer backend serve mm-prefix LMs (Gemma 3 / Gemma 4
+    # multimodal): image-token spans attend bidirectionally via FA2
+    # packed custom masks on a second prefill wrapper; text requests
+    # stay on the fast causal path. Lifts the is_mm_prefix_lm backend
+    # rejection without requiring --language-model-only.
+    "VLLM_FLASHINFER_MM_PREFIX": lambda: os.getenv("VLLM_FLASHINFER_MM_PREFIX", "")
     not in ("", "0"),
     # Control the maximum number of tokens per expert supported by the
     # NVFP4 MoE CUTLASS Kernel. This value is used to create a buffer for
