@@ -4,7 +4,10 @@
 
 from dataclasses import dataclass
 from functools import partial
-from typing import ClassVar
+import json
+import os
+import sys
+from typing import Any, ClassVar
 
 import numpy as np
 import torch
@@ -42,6 +45,11 @@ from vllm.utils.flashinfer import (
 )
 from vllm.utils.math_utils import cdiv
 from vllm.utils.platform_utils import is_pin_memory_available
+from vllm.utils.spark_tensor_trace import (
+    spark_tensor_trace,
+    spark_tensor_trace_should_emit,
+    spark_trace_last_token_summary,
+)
 from vllm.utils.torch_utils import (
     canonicalize_singleton_dim_strides,
     is_quantized_kv_cache,
@@ -77,6 +85,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.utils import CpuGpuBuffer
 
 FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT = 2048 * 1024 * 1024
+VLLM_NVFP4_V_SF_DESWIZZLE_FLAG = "-DFLASHINFER_PAGED_V_SF_DESWIZZLE=1"
 
 FP8_DTYPE = current_platform.fp8_dtype()
 FP4_DTYPE = torch.uint8
@@ -84,6 +93,694 @@ FP4_DTYPE = torch.uint8
 logger = init_logger(__name__)
 
 trtllm_gen_workspace_buffer = None
+_SPARK_KV_TRACE_COUNTS: dict[tuple[str, str], int] = {}
+_SPARK_ACTIVE_PAGE_DUMP_COUNTS: dict[tuple[str, str], int] = {}
+
+
+def _spark_kv_trace_enabled() -> bool:
+    return os.environ.get("VLLM_SPARK_KV_TRACE") == "1"
+
+
+def _spark_nvfp4_prefill_contig_out_enabled() -> bool:
+    return os.environ.get("VLLM_SPARK_NVFP4_PREFILL_CONTIG_OUT") == "1"
+
+
+def _spark_nvfp4_prefill_fresh_wrapper_replay_enabled() -> bool:
+    return os.environ.get("VLLM_SPARK_NVFP4_PREFILL_FRESH_WRAPPER_REPLAY") == "1"
+
+
+def _spark_kv_trace_int(name: str, default: int) -> int:
+    try:
+        return max(0, int(os.environ.get(name, str(default))))
+    except ValueError:
+        return default
+
+
+def _spark_kv_trace_layer_name(layer: torch.nn.Module | None) -> str | None:
+    if layer is None:
+        return None
+    name = getattr(layer, "layer_name", None)
+    return str(name) if name is not None else None
+
+
+def _spark_kv_trace_wants_layer(
+    layer_name: str | None = None,
+    layer_names: list[str] | None = None,
+) -> bool:
+    raw_filter = os.environ.get("VLLM_SPARK_KV_TRACE_LAYERS", "")
+    filters = [item.strip() for item in raw_filter.split(",") if item.strip()]
+    if not filters:
+        return True
+    candidates = []
+    if layer_name is not None:
+        candidates.append(layer_name)
+    if layer_names is not None:
+        candidates.extend(layer_names)
+    return any(f in candidate for f in filters for candidate in candidates)
+
+
+def _spark_kv_trace_should_emit(
+    event: str,
+    layer_name: str | None = None,
+    layer_names: list[str] | None = None,
+) -> bool:
+    if not _spark_kv_trace_enabled():
+        return False
+    if not _spark_kv_trace_wants_layer(layer_name, layer_names):
+        return False
+    limit = _spark_kv_trace_int("VLLM_SPARK_KV_TRACE_LIMIT", 4)
+    if limit == 0:
+        return False
+    layer_key = layer_name or ",".join(layer_names or ["<none>"])
+    key = (event, layer_key)
+    count = _SPARK_KV_TRACE_COUNTS.get(key, 0)
+    if count >= limit:
+        return False
+    _SPARK_KV_TRACE_COUNTS[key] = count + 1
+    return True
+
+
+def _spark_kv_trace_tensor_head(
+    tensor: torch.Tensor | None,
+    limit: int | None = None,
+) -> list[int | float | bool | str] | None:
+    if tensor is None:
+        return None
+    if limit is None:
+        limit = _spark_kv_trace_int("VLLM_SPARK_KV_TRACE_LIMIT", 4)
+    if limit <= 0:
+        return []
+    tensor = tensor.detach()
+    if tensor.numel() == 0:
+        return []
+    try:
+        values: list[int | float | bool | str] = []
+        shape = tuple(tensor.shape)
+        for linear_idx in range(min(limit, tensor.numel())):
+            if len(shape) == 0:
+                index = ()
+            else:
+                index_parts = []
+                remainder = linear_idx
+                for size in reversed(shape):
+                    index_parts.append(remainder % size)
+                    remainder //= size
+                index = tuple(reversed(index_parts))
+            value = tensor[index].cpu().item()
+            values.append(value)
+        return values
+    except Exception as exc:
+        return [f"<read_error:{type(exc).__name__}>"]
+
+
+def _spark_kv_trace_view_info(tensor: torch.Tensor | None) -> dict[str, object] | None:
+    if tensor is None:
+        return None
+    payload: dict[str, object] = {
+        "shape": list(tensor.shape),
+        "stride": list(tensor.stride()),
+        "storage_offset": int(tensor.storage_offset()),
+        "dtype": str(tensor.dtype),
+        "device": str(tensor.device),
+    }
+    try:
+        payload["data_ptr"] = int(tensor.data_ptr())
+        payload["storage_data_ptr"] = int(tensor.untyped_storage().data_ptr())
+    except Exception as exc:
+        payload["ptr_error"] = type(exc).__name__
+    return payload
+
+
+def _spark_kv_trace_views_info(
+    views: tuple[torch.Tensor, ...] | None,
+) -> list[dict[str, object] | None] | None:
+    if views is None:
+        return None
+    return [_spark_kv_trace_view_info(view) for view in views]
+
+
+def _spark_trace_scalar(value: object) -> float | int | str | None:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                return f"<tensor:{list(value.shape)}>"
+            return float(value.detach().cpu().item())
+        if isinstance(value, (float, int)):
+            return value
+        return float(value)  # type: ignore[arg-type]
+    except Exception as exc:
+        return f"<scalar_error:{type(exc).__name__}>"
+
+
+def _spark_tensor_trace_view_payload(
+    tensor: torch.Tensor | None,
+) -> dict[str, object] | None:
+    if tensor is None:
+        return None
+    head_tensor = tensor
+    if tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        head_tensor = tensor.view(torch.uint8)
+    return {
+        "view": _spark_kv_trace_view_info(tensor),
+        "head": _spark_kv_trace_tensor_head(head_tensor),
+    }
+
+
+def _spark_tensor_trace_tuple_payload(
+    tensors: tuple[torch.Tensor, ...] | torch.Tensor | None,
+) -> list[dict[str, object] | None] | dict[str, object] | None:
+    if tensors is None:
+        return None
+    if isinstance(tensors, tuple):
+        return [_spark_tensor_trace_view_payload(tensor) for tensor in tensors]
+    return _spark_tensor_trace_view_payload(tensors)
+
+
+def _spark_tensor_trace_compare_payload(
+    lhs: torch.Tensor | None,
+    rhs: torch.Tensor | None,
+) -> dict[str, object] | None:
+    if lhs is None or rhs is None:
+        return None
+    if lhs.shape != rhs.shape:
+        return {
+            "lhs_shape": list(lhs.shape),
+            "rhs_shape": list(rhs.shape),
+            "shape_mismatch": True,
+        }
+    try:
+        lhs_f = lhs.detach().float().reshape(-1)
+        rhs_f = rhs.detach().float().reshape(-1)
+        diff = lhs_f - rhs_f
+        finite = torch.isfinite(lhs_f) & torch.isfinite(rhs_f)
+        payload: dict[str, object] = {
+            "shape": list(lhs.shape),
+            "finite": int(finite.sum().cpu().item()),
+        }
+        if bool(finite.any().cpu().item()):
+            diff_f = diff[finite]
+            payload.update(
+                {
+                    "max_abs_diff": float(diff_f.abs().max().cpu().item()),
+                    "mean_abs_diff": float(diff_f.abs().mean().cpu().item()),
+                    "rms_diff": float(
+                        torch.sqrt(torch.mean(diff_f * diff_f)).cpu().item()
+                    ),
+                }
+            )
+            lhs_norm = torch.linalg.vector_norm(lhs_f[finite])
+            rhs_norm = torch.linalg.vector_norm(rhs_f[finite])
+            denom = lhs_norm * rhs_norm
+            if bool((denom > 0).cpu().item()):
+                payload["cosine"] = float(
+                    (torch.dot(lhs_f[finite], rhs_f[finite]) / denom)
+                    .cpu()
+                    .item()
+                )
+        return payload
+    except Exception as exc:
+        return {"compare_error": type(exc).__name__}
+
+
+def _spark_safe_repr(value: object, limit: int = 240) -> str | None:
+    if value is None:
+        return None
+    try:
+        text = repr(value)
+    except Exception as exc:
+        text = f"<repr_error:{type(exc).__name__}>"
+    if len(text) > limit:
+        return text[:limit] + "..."
+    return text
+
+
+def _spark_trace_tensor_buffer_payload(
+    tensor: torch.Tensor | None,
+) -> dict[str, object] | None:
+    if tensor is None:
+        return None
+    flat = tensor.detach().reshape(-1)
+    values = _spark_kv_trace_int("VLLM_SPARK_GEMMA_TENSOR_TRACE_VALUES", 16)
+    payload = _spark_tensor_trace_view_payload(tensor) or {}
+    if values > 0 and flat.numel() > values:
+        try:
+            payload["tail"] = _spark_kv_trace_tensor_head(flat[-values:], values)
+        except Exception as exc:
+            payload["tail_error"] = type(exc).__name__
+    return payload
+
+
+def _spark_trace_module_payload(module: object) -> dict[str, object] | None:
+    if module is None:
+        return None
+    return {
+        "type": type(module).__name__,
+        "name": getattr(module, "__name__", None),
+        "file": getattr(module, "__file__", None),
+        "repr": _spark_safe_repr(module),
+        "has_plan": hasattr(module, "plan"),
+        "has_paged_run": hasattr(module, "paged_run"),
+        "has_ragged_run": hasattr(module, "ragged_run"),
+    }
+
+
+def _spark_trace_prefill_wrapper_payload(
+    wrapper: BatchPrefillWithPagedKVCacheWrapper,
+) -> dict[str, object]:
+    flashinfer_module = sys.modules.get("flashinfer")
+    flashinfer_prefill_module = sys.modules.get("flashinfer.prefill")
+    return {
+        "wrapper_type": type(wrapper).__name__,
+        "flashinfer_file": getattr(flashinfer_module, "__file__", None),
+        "flashinfer_prefill_file": getattr(
+            flashinfer_prefill_module, "__file__", None
+        ),
+        "flashinfer_extra_cudaflags": os.environ.get(
+            "FLASHINFER_EXTRA_CUDAFLAGS", ""
+        ),
+        "backend": getattr(wrapper, "_backend", None),
+        "kv_layout": getattr(wrapper, "_kv_layout", None),
+        "use_cuda_graph": bool(getattr(wrapper, "_use_cuda_graph", False)),
+        "causal": bool(getattr(wrapper, "_causal", False)),
+        "window_left": int(getattr(wrapper, "_window_left", -9999)),
+        "logits_soft_cap": _spark_trace_scalar(
+            getattr(wrapper, "_logits_soft_cap", None)
+        ),
+        "sm_scale": _spark_trace_scalar(getattr(wrapper, "_sm_scale", None)),
+        "batch_size": int(getattr(wrapper, "_batch_size", -1)),
+        "num_qo_heads": int(getattr(wrapper, "_num_qo_heads", -1)),
+        "num_kv_heads": int(getattr(wrapper, "_num_kv_heads", -1)),
+        "qo_indptr_last": int(getattr(wrapper, "_qo_indptr_last", -1)),
+        "max_q_len": int(getattr(wrapper, "_max_q_len", -1)),
+        "max_kv_len": int(getattr(wrapper, "_max_kv_len", -1)),
+        "workspace_size": int(getattr(wrapper, "_workspace_size", -1)),
+        "cached_q_data_type": str(getattr(wrapper, "_cached_q_data_type", None)),
+        "cached_kv_data_type": str(getattr(wrapper, "_cached_kv_data_type", None)),
+        "cached_o_data_type": str(getattr(wrapper, "_cached_o_data_type", None)),
+        "fixed_split_size": int(
+            getattr(wrapper, "vllm_prefill_fixed_split_size", -9999)
+        ),
+        "disable_split_kv": bool(getattr(wrapper, "vllm_disable_split_kv", False)),
+        "plan_info_type": type(getattr(wrapper, "_plan_info", None)).__name__,
+        "plan_info_repr": _spark_safe_repr(getattr(wrapper, "_plan_info", None)),
+        "cached_module": _spark_trace_module_payload(
+            getattr(wrapper, "_cached_module", None)
+        ),
+        "jit_module": _spark_trace_module_payload(getattr(wrapper, "_jit_module", None)),
+        "qo_indptr": _spark_trace_tensor_buffer_payload(
+            getattr(wrapper, "_qo_indptr_buf", None)
+        ),
+        "paged_kv_indptr": _spark_trace_tensor_buffer_payload(
+            getattr(wrapper, "_paged_kv_indptr_buf", None)
+        ),
+        "paged_kv_indices": _spark_trace_tensor_buffer_payload(
+            getattr(wrapper, "_paged_kv_indices_buf", None)
+        ),
+        "paged_kv_last_page_len": _spark_trace_tensor_buffer_payload(
+            getattr(wrapper, "_paged_kv_last_page_len_buf", None)
+        ),
+    }
+
+
+def _spark_active_page_dump_enabled() -> bool:
+    return os.environ.get("VLLM_SPARK_ACTIVE_PAGE_DUMP") == "1"
+
+
+def _spark_active_page_dump_dir() -> str:
+    return os.environ.get("VLLM_SPARK_ACTIVE_PAGE_DUMP_DIR", "/tmp")
+
+
+def _spark_active_page_dump_limit() -> int:
+    return _spark_kv_trace_int("VLLM_SPARK_ACTIVE_PAGE_DUMP_LIMIT", 4)
+
+
+def _spark_active_page_dump_pages() -> int:
+    return _spark_kv_trace_int("VLLM_SPARK_ACTIVE_PAGE_DUMP_PAGES", 8)
+
+
+def _spark_active_page_dump_should_emit(event: str, layer_name: str | None) -> bool:
+    if not _spark_active_page_dump_enabled():
+        return False
+    if not _spark_kv_trace_wants_layer(layer_name):
+        return False
+    limit = _spark_active_page_dump_limit()
+    if limit == 0:
+        return False
+    key = (event, layer_name or "<none>")
+    count = _SPARK_ACTIVE_PAGE_DUMP_COUNTS.get(key, 0)
+    if count >= limit:
+        return False
+    _SPARK_ACTIVE_PAGE_DUMP_COUNTS[key] = count + 1
+    return True
+
+
+def _spark_active_page_dump_path(
+    event: str,
+    layer_name: str | None,
+    count: int,
+) -> str:
+    safe_layer = (layer_name or "unknown").replace("/", "_").replace(".", "_")
+    safe_layer = safe_layer[-160:]
+    return os.path.join(
+        _spark_active_page_dump_dir(),
+        f"spark_active_page_{event}_{safe_layer}_{count:04d}.pt",
+    )
+
+
+def _spark_active_page_dump_tensor(tensor: torch.Tensor | None) -> torch.Tensor | None:
+    if tensor is None:
+        return None
+    return tensor.detach().cpu()
+
+
+def _spark_active_page_dump(
+    *,
+    event: str,
+    layer_name: str | None,
+    query: torch.Tensor,
+    out_before: torch.Tensor,
+    out_after: torch.Tensor | None,
+    kv_data: tuple[torch.Tensor, ...] | None,
+    kv_scales: tuple[torch.Tensor, ...] | None,
+    wrapper: BatchPrefillWithPagedKVCacheWrapper,
+    k_scale: object,
+    v_scale: object,
+    window_left: int,
+    num_prefill_tokens: int,
+    num_decode_tokens: int,
+) -> None:
+    if not _spark_active_page_dump_should_emit(event, layer_name):
+        return
+    if kv_data is None or kv_scales is None:
+        return
+
+    count = _SPARK_ACTIVE_PAGE_DUMP_COUNTS[(event, layer_name or "<none>")]
+    max_pages = _spark_active_page_dump_pages()
+    try:
+        os.makedirs(_spark_active_page_dump_dir(), exist_ok=True)
+        indptr = getattr(wrapper, "_paged_kv_indptr_buf", None)
+        indices = getattr(wrapper, "_paged_kv_indices_buf", None)
+        last_page_len = getattr(wrapper, "_paged_kv_last_page_len_buf", None)
+        if indptr is None or indices is None or last_page_len is None:
+            return
+
+        indptr_cpu = indptr.detach().cpu()
+        last_page_len_cpu = last_page_len.detach().cpu()
+        num_indices = int(indptr_cpu[-1].item()) if indptr_cpu.numel() else 0
+        indices_cpu = indices[:num_indices].detach().cpu()
+        active_pages = torch.unique(indices_cpu).to(torch.long)
+        if max_pages > 0:
+            active_pages = active_pages[:max_pages]
+
+        payload: dict[str, object] = {
+            "schema": "spark-active-page-prefill-dump/v1",
+            "event": event,
+            "layer_name": layer_name,
+            "window_left": int(window_left),
+            "num_prefill_tokens": int(num_prefill_tokens),
+            "num_decode_tokens": int(num_decode_tokens),
+            "k_scale": _spark_trace_scalar(k_scale),
+            "v_scale": _spark_trace_scalar(v_scale),
+            "query": _spark_active_page_dump_tensor(query),
+            "out_before": _spark_active_page_dump_tensor(out_before),
+            "out_after": _spark_active_page_dump_tensor(out_after),
+            "paged_kv_indptr": indptr_cpu,
+            "paged_kv_indices": indices_cpu,
+            "paged_kv_last_page_len": last_page_len_cpu,
+            "active_pages": active_pages,
+            "kv_data_views": _spark_kv_trace_views_info(kv_data),
+            "kv_scale_views": _spark_kv_trace_views_info(kv_scales),
+            "kv_data_pages": tuple(
+                _spark_active_page_dump_tensor(view[active_pages.to(view.device)])
+                for view in kv_data
+            ),
+            "kv_scale_pages": tuple(
+                _spark_active_page_dump_tensor(view[active_pages.to(view.device)])
+                for view in kv_scales
+            ),
+        }
+        torch.save(payload, _spark_active_page_dump_path(event, layer_name, count))
+    except Exception:
+        logger.exception(
+            "Failed to dump Spark active FlashInfer prefill pages for %s",
+            layer_name,
+        )
+
+
+def _spark_kv_trace_slot_samples(
+    data_views: tuple[torch.Tensor, ...] | None,
+    scale_views: tuple[torch.Tensor, ...] | None,
+    slot_mapping: torch.Tensor | None,
+    page_size: int,
+) -> list[dict[str, object]]:
+    if data_views is None or scale_views is None or slot_mapping is None:
+        return []
+    num_slots = _spark_kv_trace_int("VLLM_SPARK_KV_TRACE_LIMIT", 4)
+    num_values = _spark_kv_trace_int("VLLM_SPARK_KV_TRACE_VALUES", 8)
+    if num_slots <= 0 or num_values <= 0:
+        return []
+    slots = _spark_kv_trace_tensor_head(slot_mapping, num_slots) or []
+    samples: list[dict[str, object]] = []
+    for raw_slot in slots:
+        try:
+            slot = int(raw_slot)
+            page = slot // page_size
+            offset = slot % page_size
+            sample: dict[str, object] = {
+                "slot": slot,
+                "page": page,
+                "offset": offset,
+            }
+            for prefix, views in (("data", data_views), ("scale", scale_views)):
+                for side, view in zip(("k", "v"), views):
+                    row = view[page, offset, 0]
+                    if prefix == "scale":
+                        row = row.view(torch.uint8)
+                    sample[f"{side}_{prefix}_head"] = _spark_kv_trace_tensor_head(
+                        row, num_values
+                    )
+            samples.append(sample)
+        except Exception as exc:
+            samples.append(
+                {
+                    "slot": raw_slot,
+                    "error": type(exc).__name__,
+                }
+            )
+    return samples
+
+
+def _spark_kv_trace(event: str, payload: dict[str, object]) -> None:
+    if not _spark_kv_trace_enabled():
+        return
+    record = {
+        "event": event,
+        "pid": os.getpid(),
+        **payload,
+    }
+    try:
+        line = json.dumps(record, sort_keys=True, default=str)
+    except Exception as exc:
+        line = json.dumps(
+            {
+                "event": event,
+                "pid": os.getpid(),
+                "json_error": type(exc).__name__,
+            },
+            sort_keys=True,
+        )
+    path = os.environ.get("VLLM_SPARK_KV_TRACE_FILE")
+    if path:
+        try:
+            with open(path, "a", encoding="utf-8") as trace_file:
+                trace_file.write(line + "\n")
+            return
+        except OSError as exc:
+            logger.warning("Failed to write Spark KV trace %s: %s", path, exc)
+    logger.warning("Spark KV trace: %s", line)
+
+
+def _vllm_nvfp4_linear_v_sf() -> bool:
+    """One knob couples writer and reader V-scale-factor layouts.
+
+    VLLM_NVFP4_KV_LINEAR_V_SF=1 makes the NVFP4 cache writer store V scale
+    factors linearly (same layout as K; read by
+    reshape_and_cache_nvfp4_dispatch in C++) and makes the FlashInfer FA2
+    reader consume them without the in-kernel de-swizzle. Linear V-SF is
+    required for head-dim-sliced V views (Gemma 4 D=512 VO-split) because
+    the trtllm 4-token swizzle does not commute with head-dim slicing.
+    """
+    value = os.environ.get("VLLM_NVFP4_KV_LINEAR_V_SF", "")
+    return value not in ("", "0")
+
+
+def _ensure_vllm_nvfp4_kv_deswizzle_flag() -> None:
+    if _vllm_nvfp4_linear_v_sf():
+        # Writer stores V-SF linearly; the reader must NOT de-swizzle.
+        logger.info_once(
+            "VLLM_NVFP4_KV_LINEAR_V_SF=1: NVFP4 V scale factors are linear; "
+            "FlashInfer in-kernel V-SF de-swizzle disabled."
+        )
+        return
+    extra_flags = os.environ.get("FLASHINFER_EXTRA_CUDAFLAGS", "")
+    if "FLASHINFER_PAGED_V_SF_DESWIZZLE" in extra_flags:
+        return
+    os.environ["FLASHINFER_EXTRA_CUDAFLAGS"] = (
+        f"{extra_flags} {VLLM_NVFP4_V_SF_DESWIZZLE_FLAG}".strip()
+    )
+
+
+def _vllm_nvfp4_kv_vosplit_requested() -> bool:
+    """VLLM_NVFP4_KV_VOSPLIT=1 opts head_size > 256 NVFP4 layers into the
+    FA2 two-pass VO split (Gemma 4 global D=512 layers)."""
+    value = os.environ.get("VLLM_NVFP4_KV_VOSPLIT", "")
+    return value not in ("", "0")
+
+
+def _vllm_flashinfer_vosplit_requested() -> bool:
+    """VLLM_FLASHINFER_VOSPLIT=1 opts head_size > 256 layers into the FA2
+    two-pass VO split for ALL KV dtypes (bf16/fp8/NVFP4). This is the
+    wholesale alternative to the Gemma 4 model-wide TRITON_ATTN force
+    (cf. vllm-project/vllm#38887, #40677)."""
+    value = os.environ.get("VLLM_FLASHINFER_VOSPLIT", "")
+    return value not in ("", "0")
+
+
+def _vo_split_factor(head_size: int, is_fa2_nvfp4: bool) -> int:
+    """Number of VO passes for the FlashInfer FA2 path.
+
+    The FA2 kernel trait guard rejects HEAD_DIM_VO > 256 (the per-thread
+    output-accumulator fragments do not fit the register budget), but
+    HEAD_DIM_QK=512 is fine, and attention decomposes exactly along the VO
+    dimension: S = Q @ K^T and the softmax are identical per pass, and
+    O = [P @ V_left | P @ V_right] concatenates with no LSE merge. So
+    head_size 512 runs as two (head_dim_qk=512, head_dim_vo=256) passes
+    over zero-copy V half views. Dtype-independent (the guard counts only
+    accumulator fragments); NVFP4 additionally needs the linear V-SF
+    layout so the scale factors slice along the head dim.
+    """
+    if head_size <= 256:
+        return 1
+    vosplit_all_dtypes = _vllm_flashinfer_vosplit_requested()
+    if is_fa2_nvfp4:
+        if not (vosplit_all_dtypes or _vllm_nvfp4_kv_vosplit_requested()):
+            raise ValueError(
+                f"NVFP4 KV with head_size={head_size} on the SM12x FA2 path "
+                "needs the two-pass VO split (the FA2 kernel caps "
+                "HEAD_DIM_VO at 256). Set VLLM_NVFP4_KV_VOSPLIT=1 and "
+                "VLLM_NVFP4_KV_LINEAR_V_SF=1 to enable it, or keep these "
+                "layers on a different KV dtype via "
+                "--kv-cache-dtype-skip-layers."
+            )
+        if not _vllm_nvfp4_linear_v_sf():
+            raise ValueError(
+                "The NVFP4 VO split requires VLLM_NVFP4_KV_LINEAR_V_SF=1: "
+                "the swizzled V-scale-factor layout spreads each 4-token "
+                "group across the full scale row and cannot be sliced "
+                "along the head dimension."
+            )
+    elif not vosplit_all_dtypes:
+        # Dense/fp8 KV: without the knob, keep the pre-existing behavior
+        # (backend selection / the Gemma4 TRITON_ATTN force handles >256).
+        return 1
+    split = -(-head_size // 256)
+    if head_size % split != 0 or (
+        is_fa2_nvfp4 and (head_size // split) % 16 != 0
+    ):
+        raise ValueError(
+            "The VO split needs head_size divisible into <=256-wide "
+            f"chunks{' of whole 16-element scale blocks' if is_fa2_nvfp4 else ''};"
+            f" got head_size={head_size}."
+        )
+    return split
+
+
+def _flashinfer_dtype_uri_part(dtype: torch.dtype) -> str:
+    return str(dtype).replace("torch.", "").replace(".", "_")
+
+
+def _fa2_nvfp4_prefill_jit_args(
+    *,
+    q_data_type: torch.dtype,
+    kv_data_type: torch.dtype,
+    o_data_type: torch.dtype,
+    idtype: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    use_sliding_window: bool,
+    use_logits_soft_cap: bool,
+    pos_encoding_mode: int = 0,
+    use_fp16_qk_reduction: bool = False,
+) -> tuple[list[Any], dict[str, Any]]:
+    """Build a FlashInfer FA2 paged-prefill JIT module that declares FP4 KV."""
+
+    uri = (
+        "vllm_batch_prefill_nvfp4_kv_"
+        f"dtype_q_{_flashinfer_dtype_uri_part(q_data_type)}_"
+        "dtype_kv_fp4x2_e2m1_"
+        f"dtype_o_{_flashinfer_dtype_uri_part(o_data_type)}_"
+        f"dtype_idx_{_flashinfer_dtype_uri_part(idtype)}_"
+        f"head_dim_qk_{head_dim_qk}_"
+        f"head_dim_vo_{head_dim_vo}_"
+        f"posenc_{pos_encoding_mode}_"
+        f"swa_{int(use_sliding_window)}_"
+        f"logits_cap_{int(use_logits_soft_cap)}_"
+        f"fp16_qk_{int(use_fp16_qk_reduction)}"
+    )
+    jit_args: list[Any] = [
+        uri,
+        q_data_type,
+        kv_data_type,
+        o_data_type,
+        idtype,
+        head_dim_qk,
+        head_dim_vo,
+        [
+            "maybe_custom_mask",
+            "maybe_mask_indptr",
+            "maybe_alibi_slopes",
+            "maybe_prefix_len_ptr",
+            "maybe_token_pos_in_items_ptr",
+            "maybe_max_item_len_ptr",
+            "maybe_k_cache_sf",
+            "maybe_v_cache_sf",
+        ],
+        [
+            "uint8_t",
+            "int32_t",
+            "float",
+            "uint32_t",
+            "uint16_t",
+            "uint16_t",
+            "uint8_t",
+            "uint8_t",
+        ],
+        [
+            "logits_soft_cap",
+            "sm_scale",
+            "rope_rcp_scale",
+            "rope_rcp_theta",
+            "token_pos_in_items_len",
+        ],
+        ["double", "double", "double", "double", "int64_t"],
+        (
+            "DefaultAttention<use_custom_mask, "
+            f"{str(use_sliding_window).lower()}, "
+            f"{str(use_logits_soft_cap).lower()}, "
+            f"{str(pos_encoding_mode == 2).lower()}>"
+        ),
+        "#include<flashinfer/attention/variants.cuh>",
+    ]
+    jit_kwargs = {
+        "pos_encoding_mode": pos_encoding_mode,
+        "use_sliding_window": use_sliding_window,
+        "use_logits_soft_cap": use_logits_soft_cap,
+        "use_fp16_qk_reduction": use_fp16_qk_reduction,
+        "fp8_enabled": False,
+    }
+    return jit_args, jit_kwargs
 
 
 def _get_trtllm_gen_workspace_buffer():
@@ -616,21 +1313,37 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.page_size = self.kv_cache_spec.block_size
 
         if self.kv_cache_spec.kv_quant_mode != KVQuantMode.NONE:
-            self.cache_dtype = self.cache_config.cache_dtype
-            # Cannot use self.kv_cache_spec.dtype here because kv_cache_spec
-            # storage dtype may not be the same as the op dtype (uint8 vs fp8_e4m3)
+            # Prefer the dtype string the layer group resolved to: with
+            # per-layer mixed KV dtypes (kv_cache_dtype_skip_layers
+            # overrides) the global cache_config.cache_dtype no longer
+            # describes every group. Cannot use self.kv_cache_spec.dtype
+            # because kv_cache_spec storage dtype may not be the same as
+            # the op dtype (uint8 vs fp8_e4m3).
+            self.cache_dtype = (
+                getattr(self.kv_cache_spec, "cache_dtype_str", None)
+                or self.cache_config.cache_dtype
+            )
             self.is_kvcache_nvfp4 = self.cache_dtype == "nvfp4"
+            self.use_fa2_nvfp4_kv = False
             if self.is_kvcache_nvfp4:
-                # trtllm-gen FP4 FMHA kernels only exist for sm100f (sm_100/sm_103).
-                # Fail fast at init rather than crashing on the first request.
-                if not current_platform.is_device_capability_family(100):
-                    raise ValueError(
-                        "--kv-cache-dtype nvfp4 requires sm100f, "
-                        "please try a different dtype or remove"
+                self.use_fa2_nvfp4_kv = current_platform.is_device_capability_family(
+                    120
+                )
+                if self.use_fa2_nvfp4_kv:
+                    self.kv_cache_dtype = FlashInferBackend.get_dtype_for_flashinfer(
+                        "nvfp4"
                     )
-                # For NVFP4, kv_cache_dtype stays as the string "nvfp4"
-                # which is passed to FlashInferImpl
-                self.kv_cache_dtype = self.cache_dtype
+                # trtllm-gen FP4 FMHA kernels only exist for sm100f (sm_100/sm_103).
+                # SM12x routes NVFP4 KV through FlashInfer FA2 instead.
+                elif current_platform.is_device_capability_family(100):
+                    # For NVFP4, kv_cache_dtype stays as the string "nvfp4"
+                    # which is passed to FlashInferImpl.
+                    self.kv_cache_dtype = self.cache_dtype
+                else:
+                    raise ValueError(
+                        "--kv-cache-dtype nvfp4 requires sm100f or SM12x, "
+                        "please try a different dtype or remove it."
+                    )
             else:
                 self.kv_cache_dtype = FlashInferBackend.get_dtype_for_flashinfer(
                     self.cache_dtype
@@ -638,6 +1351,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         else:
             self.cache_dtype = "auto"
             self.is_kvcache_nvfp4 = False
+            self.use_fa2_nvfp4_kv = False
             assert self.kv_cache_spec.dtype == self.model_config.dtype
             self.kv_cache_dtype = self.kv_cache_spec.dtype
 
@@ -650,6 +1364,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         if (
             can_use_trtllm
             and not vllm_config.attention_config.disable_flashinfer_q_quantization
+            and not self.use_fa2_nvfp4_kv
         ):
             if self.is_kvcache_nvfp4:
                 # NVFP4 KV cache uses FP8 quantized queries
@@ -663,8 +1378,44 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
         # Prefer TRTLLM attention for decoding in all cases.
         # This allows us to use AttentionCGSupport.UNIFORM_BATCH mode.
-        self.use_trtllm_decode_attention = can_use_trtllm
-        self._init_reorder_batch_threshold(1, supports_spec_as_decode=can_use_trtllm)
+        self.use_trtllm_decode_attention = can_use_trtllm and not (
+            self.use_fa2_nvfp4_kv
+        )
+        self._init_reorder_batch_threshold(
+            1, supports_spec_as_decode=self.use_trtllm_decode_attention
+        )
+
+        if self.use_fa2_nvfp4_kv and self.use_dcp:
+            raise NotImplementedError(
+                "FlashInfer FA2 NVFP4 KV on SM12x is not wired for DCP yet."
+            )
+        if self.use_fa2_nvfp4_kv:
+            _ensure_vllm_nvfp4_kv_deswizzle_flag()
+            logger.info_once(
+                "Using FlashInfer FA2 backend for NVFP4 KV cache on SM12x "
+                "(V-scale-factor mode: %s).",
+                "linear, in-kernel deswizzle disabled"
+                if _vllm_nvfp4_linear_v_sf()
+                else "swizzled, in-kernel deswizzle enabled",
+            )
+
+        self.vo_split = _vo_split_factor(
+            self.head_dim, self.use_fa2_nvfp4_kv
+        )
+        if self.vo_split > 1:
+            # BatchDecodeWithPagedKVCacheWrapper.plan() has no head_dim_vo,
+            # so route every request through the VO-split-planned prefill
+            # wrapper: threshold 0 classifies nothing as decode, and a
+            # causal qo_len==1 prefill computes exactly what decode would.
+            self.reorder_batch_threshold = 0
+            logger.info_once(
+                "FA2 VO split (%s KV): head_size %d runs as %d passes of "
+                "head_dim_vo=%d; decode requests use the prefill wrapper.",
+                self.cache_dtype,
+                self.head_dim,
+                self.vo_split,
+                self.head_dim // self.vo_split,
+            )
 
         self._cascade_wrapper = None  # Wrapper for cascade attention
 
@@ -738,6 +1489,18 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 # FlashInfer only applies to attention, so we don't consider other types
                 # of KV spec (e.g. Mamba) here. This is mostly for type checking.
                 continue
+            if spec.head_size > 256 and (
+                _vllm_flashinfer_vosplit_requested()
+                or (
+                    spec.kv_quant_mode != KVQuantMode.NONE
+                    and current_platform.is_device_capability_family(120)
+                    and _vllm_nvfp4_kv_vosplit_requested()
+                )
+            ):
+                # The VO-split group routes decodes through the
+                # dynamically planned prefill wrapper, which cudagraph
+                # capture cannot replay. Piecewise graphs are unaffected.
+                return AttentionCGSupport.NEVER
             if not can_use_trtllm_attention(
                 num_qo_heads=num_qo_heads,
                 num_kv_heads=spec.num_kv_heads,
@@ -773,13 +1536,39 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     dcp_a2a=self.dcp_a2a,
                 )
             else:
-                # NVFP4 KV cache requires the trtllm-gen backend inside
-                # the wrapper; fa2/fa3 do not support nvfp4.
-                backend = "trtllm-gen" if self.is_kvcache_nvfp4 else "auto"
+                if self.use_fa2_nvfp4_kv:
+                    backend = "fa2"
+                    o_dtype = self.model_config.dtype
+                    jit_args, jit_kwargs = _fa2_nvfp4_prefill_jit_args(
+                        q_data_type=self.q_data_type,
+                        kv_data_type=self.kv_cache_dtype,
+                        o_data_type=o_dtype,
+                        idtype=torch.int32,
+                        head_dim_qk=self.head_dim,
+                        # Ctor jit_args override plan-time head_dim_vo, so
+                        # the VO split MUST be reflected here too: the 31B
+                        # full-NVFP4 smoke crashed at prefill.cuh:3215 with
+                        # NUM_MMA_D_VO=32 (vo=512 reached the kernel)
+                        # because this arg pinned the symmetric pair while
+                        # plan() asked for (512, 256).
+                        head_dim_vo=self.head_dim // self.vo_split,
+                        use_sliding_window=self.window_left >= 0,
+                        use_logits_soft_cap=(self.logits_soft_cap or 0.0) > 0,
+                    )
+                elif self.is_kvcache_nvfp4:
+                    backend = "trtllm-gen"
+                    jit_args = None
+                    jit_kwargs = None
+                else:
+                    backend = "auto"
+                    jit_args = None
+                    jit_kwargs = None
                 self._prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
                     self._get_workspace_buffer(),
                     get_kv_cache_layout(),
                     backend=backend,
+                    jit_args=jit_args,
+                    jit_kwargs=jit_kwargs,
                 )
         assert self._prefill_wrapper is not None
         return self._prefill_wrapper
@@ -799,9 +1588,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 paged_kv_indptr = None
                 paged_kv_indices = None
                 paged_kv_last_page_len = None
-            # NVFP4 KV cache requires the trtllm-gen backend inside
-            # the wrapper; fa2/fa3 do not support nvfp4.
-            backend = "trtllm-gen" if self.is_kvcache_nvfp4 else "auto"
+            if self.use_fa2_nvfp4_kv:
+                backend = "fa2"
+            elif self.is_kvcache_nvfp4:
+                backend = "trtllm-gen"
+            else:
+                backend = "auto"
             decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
                 self._get_workspace_buffer(),
                 get_kv_cache_layout(),
@@ -917,19 +1709,22 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # - Decode (FI native or TRTLLM)
         use_cascade = common_prefix_len > 0
         uses_spec_reorder = self.reorder_batch_threshold > 1
-        prefill_use_trtllm = use_trtllm_attention(
-            self.num_qo_heads,
-            self.num_kv_heads,
-            num_prefill_tokens,
-            max_seq_len,
-            self.dcp_world_size,
-            self.cache_dtype,
-            self.q_data_type,
-            is_prefill=True,
-            force_use_trtllm=self.attention_config.use_trtllm_attention,
-            has_sinks=self.has_sinks,
-            has_spec=uses_spec_reorder,
-        )
+        if self.use_fa2_nvfp4_kv:
+            prefill_use_trtllm = False
+        else:
+            prefill_use_trtllm = use_trtllm_attention(
+                self.num_qo_heads,
+                self.num_kv_heads,
+                num_prefill_tokens,
+                max_seq_len,
+                self.dcp_world_size,
+                self.cache_dtype,
+                self.q_data_type,
+                is_prefill=True,
+                force_use_trtllm=self.attention_config.use_trtllm_attention,
+                has_sinks=self.has_sinks,
+                has_spec=uses_spec_reorder,
+            )
         decode_use_trtllm = (
             self.use_trtllm_decode_attention and self.dcp_world_size <= 1
         )
@@ -1038,6 +1833,47 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             )
         else:
             paged_kv_indices = None
+
+        if _spark_kv_trace_should_emit(
+            "fi_metadata", layer_names=self.layer_names
+        ):
+            limit = _spark_kv_trace_int("VLLM_SPARK_KV_TRACE_LIMIT", 4)
+            _spark_kv_trace(
+                "fi_metadata",
+                {
+                    "layer_names": self.layer_names,
+                    "cache_dtype": str(self.cache_dtype),
+                    "kv_cache_dtype": str(self.kv_cache_dtype),
+                    "page_size": int(page_size),
+                    "head_dim": int(self.head_dim),
+                    "num_q_heads": int(self.num_qo_heads),
+                    "num_kv_heads": int(self.num_kv_heads),
+                    "window_left": int(self.window_left),
+                    "num_reqs": int(num_reqs),
+                    "num_actual_tokens": int(num_actual_tokens),
+                    "num_decodes": int(num_decodes),
+                    "num_decode_tokens": int(num_decode_tokens),
+                    "num_prefills": int(num_prefills),
+                    "num_prefill_tokens": int(num_prefill_tokens),
+                    "slot_mapping_head": _spark_kv_trace_tensor_head(
+                        common_attn_metadata.slot_mapping, limit
+                    ),
+                    "block_table_head": _spark_kv_trace_tensor_head(
+                        block_table_tensor, limit
+                    ),
+                    "paged_kv_indptr_head": _spark_kv_trace_tensor_head(
+                        self.paged_kv_indptr.cpu[: num_reqs + 1], limit
+                    ),
+                    "paged_kv_indices_head": _spark_kv_trace_tensor_head(
+                        paged_kv_indices, limit
+                    ),
+                    "paged_kv_last_page_len_head": _spark_kv_trace_tensor_head(
+                        self.paged_kv_last_page_len.cpu[:num_reqs], limit
+                    ),
+                    "prefill_use_trtllm": bool(prefill_use_trtllm),
+                    "decode_use_trtllm": bool(decode_use_trtllm),
+                },
+            )
 
         # Early-out for cascade attention
         if use_cascade:
@@ -1166,11 +2002,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         prefill_wrapper,
                         BatchPrefillWithPagedKVCacheWrapper,
                     )
-                    # NVFP4 trtllm kernel only supports FP8 output;
-                    # use FP8 o_data_type so the wrapper matches the
-                    # FP8 output buffer allocated in forward().
+                    # The SM100 trtllm NVFP4 path only supports FP8 output.
+                    # The SM12x FA2 path writes model dtype directly.
                     o_dtype = (
-                        FP8_DTYPE if self.is_kvcache_nvfp4 else self.model_config.dtype
+                        FP8_DTYPE
+                        if self.is_kvcache_nvfp4 and not self.use_fa2_nvfp4_kv
+                        else self.model_config.dtype
                     )
                     prefill_wrapper.plan(
                         qo_indptr=qo_indptr_prefill_cpu,
@@ -1180,6 +2017,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         num_qo_heads=self.num_qo_heads,
                         num_kv_heads=self.num_kv_heads,
                         head_dim_qk=self.head_dim,
+                        # == head_dim_qk unless the NVFP4 VO split is active;
+                        # then the impl runs this wrapper once per V half.
+                        head_dim_vo=self.head_dim // self.vo_split,
                         page_size=self.page_size,
                         causal=True,
                         sm_scale=self.sm_scale,
@@ -1191,10 +2031,19 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         fixed_split_size=self.prefill_fixed_split_size,
                         disable_split_kv=self.disable_split_kv,
                     )
+                    prefill_wrapper.vllm_prefill_fixed_split_size = (
+                        self.prefill_fixed_split_size
+                    )
+                    prefill_wrapper.vllm_disable_split_kv = self.disable_split_kv
                 attn_metadata.prefill = FIPrefill(wrapper=prefill_wrapper)
 
         ## DECODE PATHWAY
         if num_decodes > 0:
+            assert self.vo_split == 1, (
+                "NVFP4 VO split routes decodes through the prefill wrapper "
+                "(reorder_batch_threshold=0); the decode pathway should be "
+                "unreachable."
+            )
             if decode_use_trtllm:
                 assert num_decode_tokens % num_decodes == 0, (
                     "TRTLLM decode requires uniform query lengths per request. "
@@ -1221,11 +2070,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 # Use the persistent buffer with padding length,
                 # instead of the same address but chunked version
                 # in atten_metadata when using cudagraph.
-                # NVFP4 trtllm kernel only supports FP8 output;
-                # use FP8 o_data_type so the wrapper matches the
-                # FP8 output buffer allocated in forward().
+                # The SM100 trtllm NVFP4 path only supports FP8 output.
+                # The SM12x FA2 path writes model dtype directly.
                 o_dtype = (
-                    FP8_DTYPE if self.is_kvcache_nvfp4 else self.model_config.dtype
+                    FP8_DTYPE
+                    if self.is_kvcache_nvfp4 and not self.use_fa2_nvfp4_kv
+                    else self.model_config.dtype
                 )
                 fast_plan_decode(
                     decode_wrapper,
@@ -1295,7 +2145,16 @@ class FlashInferImpl(AttentionImpl):
         )
         self.kv_cache_dtype = kv_cache_dtype
         self.is_kvcache_nvfp4 = kv_cache_dtype == "nvfp4"
+        self.use_fa2_nvfp4_kv = (
+            self.is_kvcache_nvfp4
+            and current_platform.is_device_capability_family(120)
+        )
+        if self.use_fa2_nvfp4_kv:
+            _ensure_vllm_nvfp4_kv_deswizzle_flag()
         self.fp4_data_dim = head_size // 2 if self.is_kvcache_nvfp4 else 0
+        self.vo_split = _vo_split_factor(
+            head_size, self.use_fa2_nvfp4_kv
+        )
         self.logits_soft_cap = logits_soft_cap
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
 
@@ -1330,8 +2189,13 @@ class FlashInferImpl(AttentionImpl):
         self.bmm2_scale: float | None = None
         self.o_sf_scale: float | None = None
 
-        # Pre-allocated FP8 output buffer for NVFP4 without fused output quant.
-        if self.is_kvcache_nvfp4 and vllm_config is not None:
+        # Pre-allocated FP8 output buffer for SM100 TRTLLM NVFP4 without
+        # fused output quant. The SM12x FA2 path writes model dtype directly.
+        if (
+            self.is_kvcache_nvfp4
+            and not self.use_fa2_nvfp4_kv
+            and vllm_config is not None
+        ):
             max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
             self._nvfp4_fp8_out = torch.empty(
                 (max_num_tokens, num_heads, head_size),
@@ -1362,6 +2226,234 @@ class FlashInferImpl(AttentionImpl):
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         if self.sinks is not None and self.sinks.dtype != torch.float32:
             self.sinks = self.sinks.to(torch.float32)
+
+    def _run_vo_split_prefill(
+        self,
+        wrapper: BatchPrefillWithPagedKVCacheWrapper,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        kv_sf: tuple[torch.Tensor, torch.Tensor] | None,
+        out: torch.Tensor,
+        *,
+        k_scale: float,
+        v_scale: float,
+    ) -> None:
+        """Multi-pass FA2 run for head_size > 256 (any KV dtype).
+
+        The wrapper is planned with head_dim_vo = head_size // split, and
+        each pass consumes a zero-copy head-dim slice of V (and, for
+        NVFP4, of the V scale factors): S = Q @ K^T and the softmax are
+        recomputed identically per pass, so the per-pass outputs
+        concatenate exactly (no LSE merge). narrow() keeps the full
+        tensor's strides, which the FA2 path requires: the K/V
+        stride-equality check passes and the run sizes its output from
+        the V view's width. NVFP4 additionally requires the linear V-SF
+        layout (enforced in _vo_split_factor) — the swizzled layout does
+        not slice along the head dim.
+        """
+        split = self.vo_split
+        head_chunk = self.head_size // split
+        if self.is_kvcache_nvfp4:
+            assert isinstance(kv_cache, tuple) and kv_sf is not None
+            k_cache, v_cache = kv_cache
+            k_sf, v_sf = kv_sf
+            data_step = head_chunk // 2  # packed e2m1, 2 elements per byte
+            sf_step = head_chunk // 16  # one fp8 scale per 16 elements
+        else:
+            # Dense bf16/fp16 or fp8 KV: a stacked (num_pages, 2, ...)
+            # cache or an explicit (k, v) pair; V slices are plain
+            # element-width views and there are no scale factors.
+            if isinstance(kv_cache, tuple):
+                k_cache, v_cache = kv_cache
+            else:
+                k_cache, v_cache = kv_cache[:, 0], kv_cache[:, 1]
+            k_sf = v_sf = None
+            data_step = head_chunk
+            sf_step = 0
+        for i in range(split):
+            v_cache_i = v_cache.narrow(-1, i * data_step, data_step)
+            kv_sf_i = (
+                (k_sf, v_sf.narrow(-1, i * sf_step, sf_step))
+                if v_sf is not None
+                else None
+            )
+            # The kernel needs a contiguous output; write into a chunk
+            # buffer and copy into the strided slice of the full output.
+            out_i = torch.empty(
+                (*out.shape[:-1], head_chunk),
+                dtype=out.dtype,
+                device=out.device,
+            )
+            wrapper.run(
+                query,
+                (k_cache, v_cache_i),
+                k_scale=k_scale,
+                v_scale=v_scale,
+                out=out_i,
+                kv_cache_sf=kv_sf_i,
+            )
+            out.narrow(-1, i * head_chunk, head_chunk).copy_(out_i)
+
+    def _spark_nvfp4_prefill_fresh_wrapper_replay(
+        self,
+        *,
+        layer: torch.nn.Module,
+        layer_name: str | None,
+        live_wrapper: BatchPrefillWithPagedKVCacheWrapper,
+        prefill_query: torch.Tensor,
+        kv_cache_permute: tuple[torch.Tensor, ...],
+        kv_cache_sf: tuple[torch.Tensor, ...] | None,
+        live_out: torch.Tensor,
+    ) -> None:
+        if (
+            not self.is_kvcache_nvfp4
+            or not self.use_fa2_nvfp4_kv
+            or not _spark_nvfp4_prefill_fresh_wrapper_replay_enabled()
+        ):
+            return
+        if not spark_tensor_trace_should_emit(
+            "flashinfer_wrapper_prefill_fresh_replay", layer_name
+        ):
+            return
+
+        payload: dict[str, object] = {
+            "layer_name": layer_name,
+            "kv_cache_dtype": str(self.kv_cache_dtype),
+            "window_left": int(self.window_left),
+            "head_dim": int(self.head_size),
+            "num_q_heads": int(self.num_heads),
+            "num_kv_heads": int(self.num_kv_heads),
+            "live_wrapper_type": type(live_wrapper).__name__,
+            "live_out": spark_trace_last_token_summary(live_out),
+        }
+        try:
+            qo_indptr = getattr(live_wrapper, "_qo_indptr_buf", None)
+            paged_kv_indptr = getattr(live_wrapper, "_paged_kv_indptr_buf", None)
+            paged_kv_indices = getattr(live_wrapper, "_paged_kv_indices_buf", None)
+            paged_kv_last_page_len = getattr(
+                live_wrapper, "_paged_kv_last_page_len_buf", None
+            )
+            if (
+                qo_indptr is None
+                or paged_kv_indptr is None
+                or paged_kv_indices is None
+                or paged_kv_last_page_len is None
+            ):
+                payload["replay_error"] = "missing_wrapper_plan_buffers"
+                spark_tensor_trace("flashinfer_wrapper_prefill_fresh_replay", payload)
+                return
+
+            batch_size = int(getattr(live_wrapper, "_batch_size", len(qo_indptr) - 1))
+            if batch_size <= 0:
+                payload["replay_error"] = "empty_batch"
+                spark_tensor_trace("flashinfer_wrapper_prefill_fresh_replay", payload)
+                return
+
+            num_pages = int(paged_kv_indptr[batch_size].detach().cpu().item())
+            qo_indptr = qo_indptr[: batch_size + 1]
+            paged_kv_indptr = paged_kv_indptr[: batch_size + 1]
+            paged_kv_indices = paged_kv_indices[:num_pages]
+            paged_kv_last_page_len = paged_kv_last_page_len[:batch_size]
+
+            workspace_mb = _spark_kv_trace_int(
+                "VLLM_SPARK_NVFP4_FRESH_WRAPPER_WORKSPACE_MB", 256
+            )
+            workspace_bytes = max(1, workspace_mb) * 1024 * 1024
+            workspace = torch.empty(
+                (workspace_bytes,), dtype=torch.uint8, device=prefill_query.device
+            )
+            fresh_wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                workspace,
+                get_kv_cache_layout(),
+                backend="fa2",
+            )
+
+            live_fixed_split_size = int(
+                getattr(live_wrapper, "vllm_prefill_fixed_split_size", -1)
+            )
+            live_disable_split_kv = bool(
+                getattr(live_wrapper, "vllm_disable_split_kv", False)
+            )
+            replay_q_data_type = getattr(
+                live_wrapper, "_cached_q_data_type", prefill_query.dtype
+            )
+            replay_kv_data_type = getattr(
+                live_wrapper, "_cached_kv_data_type", self.kv_cache_dtype
+            )
+            replay_o_data_type = getattr(
+                live_wrapper, "_cached_o_data_type", prefill_query.dtype
+            )
+            fresh_wrapper.plan(
+                qo_indptr=qo_indptr,
+                paged_kv_indptr=paged_kv_indptr,
+                paged_kv_indices=paged_kv_indices,
+                paged_kv_last_page_len=paged_kv_last_page_len,
+                num_qo_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim_qk=self.head_size,
+                page_size=kv_cache_permute[0].shape[
+                    2 if get_kv_cache_layout() == "HND" else 1
+                ],
+                causal=True,
+                sm_scale=self.scale,
+                window_left=self.window_left,
+                logits_soft_cap=self.logits_soft_cap,
+                q_data_type=replay_q_data_type,
+                kv_data_type=replay_kv_data_type,
+                o_data_type=replay_o_data_type,
+                fixed_split_size=live_fixed_split_size,
+                disable_split_kv=live_disable_split_kv,
+            )
+            fresh_out = torch.empty_like(prefill_query)
+            fresh_wrapper.run(
+                prefill_query,
+                kv_cache_permute,
+                k_scale=layer._k_scale_float,
+                v_scale=layer._v_scale_float,
+                out=fresh_out,
+                kv_cache_sf=kv_cache_sf,
+            )
+            payload.update(
+                {
+                    "batch_size": batch_size,
+                    "num_pages": num_pages,
+                    "workspace_mb": workspace_mb,
+                    "fixed_split_size": live_fixed_split_size,
+                    "disable_split_kv": live_disable_split_kv,
+                    "q_data_type": str(replay_q_data_type),
+                    "kv_data_type": str(replay_kv_data_type),
+                    "o_data_type": str(replay_o_data_type),
+                    "fresh_out": spark_trace_last_token_summary(fresh_out),
+                    "fresh_vs_live": _spark_tensor_trace_compare_payload(
+                        fresh_out, live_out
+                    ),
+                    "fresh_wrapper_backend": getattr(
+                        fresh_wrapper, "_backend", "<unknown>"
+                    ),
+                    "fresh_cached_module": type(
+                        getattr(fresh_wrapper, "_cached_module", None)
+                    ).__name__,
+                    "live_wrapper_backend": getattr(
+                        live_wrapper, "_backend", "<unknown>"
+                    ),
+                    "live_cached_module": type(
+                        getattr(live_wrapper, "_cached_module", None)
+                    ).__name__,
+                    "fresh_wrapper_plan": _spark_trace_prefill_wrapper_payload(
+                        fresh_wrapper
+                    ),
+                    "live_wrapper_plan": _spark_trace_prefill_wrapper_payload(
+                        live_wrapper
+                    ),
+                }
+            )
+        except Exception as exc:
+            payload["replay_error"] = type(exc).__name__
+            payload["replay_error_message"] = str(exc)
+            logger.exception(
+                "Failed Spark fresh FlashInfer prefill replay for %s", layer_name
+            )
+        spark_tensor_trace("flashinfer_wrapper_prefill_fresh_replay", payload)
 
     def forward(
         self,
@@ -1455,6 +2547,7 @@ class FlashInferImpl(AttentionImpl):
         # performance to make sure it does not introduce any overhead.
 
         num_actual_tokens = attn_metadata.num_actual_tokens
+        layer_name = _spark_kv_trace_layer_name(layer)
 
         # FlashInfer treats uint8 KV cache as NVFP4. vLLM stores FP8 KV cache
         # as uint8 bytes, so pass FP8 caches with their logical dtype.
@@ -1511,6 +2604,65 @@ class FlashInferImpl(AttentionImpl):
             nvfp4_kv_data, nvfp4_kv_block_scales = nvfp4_kv_cache_split_views(
                 kv_cache_permute
             )
+            if _spark_kv_trace_should_emit(
+                "kv_read_views_nvfp4", layer_name=layer_name
+            ):
+                page_size = int(kv_cache_permute.shape[2])
+                _spark_kv_trace(
+                    "kv_read_views_nvfp4",
+                    {
+                        "layer_name": layer_name,
+                        "kv_cache_dtype": str(self.kv_cache_dtype),
+                        "kv_cache_shape": list(kv_cache.shape),
+                        "kv_cache_stride": list(kv_cache.stride()),
+                        "kv_cache_permute_shape": list(kv_cache_permute.shape),
+                        "kv_cache_permute_stride": list(kv_cache_permute.stride()),
+                        "data_views": _spark_kv_trace_views_info(nvfp4_kv_data),
+                        "scale_views": _spark_kv_trace_views_info(
+                            nvfp4_kv_block_scales
+                        ),
+                        "slot_mapping_head": _spark_kv_trace_tensor_head(
+                            attn_metadata.slot_mapping
+                        ),
+                        "slot_samples": _spark_kv_trace_slot_samples(
+                            nvfp4_kv_data,
+                            nvfp4_kv_block_scales,
+                            attn_metadata.slot_mapping,
+                            page_size,
+                        ),
+                        "num_actual_tokens": int(num_actual_tokens),
+                        "num_decodes": int(attn_metadata.num_decodes),
+                        "num_decode_tokens": int(num_decode_tokens),
+                        "num_prefills": int(attn_metadata.num_prefills),
+                        "num_prefill_tokens": int(num_prefill_tokens),
+                        "window_left": int(self.window_left),
+                        "head_dim": int(self.head_size),
+                        "num_q_heads": int(self.num_heads),
+                        "num_kv_heads": int(self.num_kv_heads),
+                    },
+                )
+        if spark_tensor_trace_should_emit("flashinfer_attn_input", layer_name):
+            spark_tensor_trace(
+                "flashinfer_attn_input",
+                {
+                    "layer_name": layer_name,
+                    "kv_cache_dtype": str(self.kv_cache_dtype),
+                    "is_kvcache_nvfp4": bool(self.is_kvcache_nvfp4),
+                    "use_fa2_nvfp4_kv": bool(self.use_fa2_nvfp4_kv),
+                    "window_left": int(self.window_left),
+                    "head_dim": int(self.head_size),
+                    "num_q_heads": int(self.num_heads),
+                    "num_kv_heads": int(self.num_kv_heads),
+                    "num_actual_tokens": int(num_actual_tokens),
+                    "num_decodes": int(attn_metadata.num_decodes),
+                    "num_decode_tokens": int(num_decode_tokens),
+                    "num_prefills": int(attn_metadata.num_prefills),
+                    "num_prefill_tokens": int(num_prefill_tokens),
+                    "query_last": spark_trace_last_token_summary(query),
+                    "key_last": spark_trace_last_token_summary(key),
+                    "value_last": spark_trace_last_token_summary(value),
+                },
+            )
 
         use_dcp = self.dcp_world_size > 1
 
@@ -1564,30 +2716,223 @@ class FlashInferImpl(AttentionImpl):
                         nvfp4_kv_block_scales if self.is_kvcache_nvfp4 else None
                     )
 
-                    # NVFP4 trtllm kernel only supports FP8 output.
-                    # Use a pre-allocated FP8 buffer and dequantize
-                    # afterwards.
+                    # SM100 TRTLLM NVFP4 only supports FP8 output. The SM12x
+                    # FA2 path writes model dtype directly.
                     needs_fp8_out_prefill = (
-                        self.is_kvcache_nvfp4 and output.dtype != FP8_DTYPE
+                        self.is_kvcache_nvfp4
+                        and not self.use_fa2_nvfp4_kv
+                        and output.dtype != FP8_DTYPE
                     )
                     if needs_fp8_out_prefill:
                         out_prefill = self._nvfp4_fp8_out[:num_prefill_tokens]
                     else:
                         out_prefill = output[num_decode_tokens:]
-
-                    prefill_wrapper.run(
-                        prefill_query,
-                        kv_cache_permute,
-                        k_scale=layer._k_scale_float,
-                        v_scale=layer._v_scale_float,
-                        out=out_prefill,
-                        kv_cache_sf=kv_cache_sf,
+                    out_prefill_target = out_prefill
+                    uses_contig_out_prefill = (
+                        self.is_kvcache_nvfp4
+                        and self.use_fa2_nvfp4_kv
+                        and _spark_nvfp4_prefill_contig_out_enabled()
                     )
+                    if uses_contig_out_prefill:
+                        out_prefill = torch.empty_like(prefill_query)
+                    dump_out_before = (
+                        out_prefill.detach().clone()
+                        if _spark_active_page_dump_enabled()
+                        else None
+                    )
+
+                    if spark_tensor_trace_should_emit(
+                        "flashinfer_wrapper_prefill_pre", layer_name
+                    ):
+                        spark_tensor_trace(
+                            "flashinfer_wrapper_prefill_pre",
+                            {
+                                "layer_name": layer_name,
+                                "kv_cache_dtype": str(self.kv_cache_dtype),
+                                "is_kvcache_nvfp4": bool(self.is_kvcache_nvfp4),
+                                "use_fa2_nvfp4_kv": bool(self.use_fa2_nvfp4_kv),
+                                "needs_fp8_out": bool(needs_fp8_out_prefill),
+                                "uses_contig_out": bool(uses_contig_out_prefill),
+                                "wrapper_type": type(prefill_wrapper).__name__,
+                                "window_left": int(self.window_left),
+                                "head_dim": int(self.head_size),
+                                "num_q_heads": int(self.num_heads),
+                                "num_kv_heads": int(self.num_kv_heads),
+                                "num_prefill_tokens": int(num_prefill_tokens),
+                                "num_decode_tokens": int(num_decode_tokens),
+                                "k_scale": _spark_trace_scalar(layer._k_scale_float),
+                                "v_scale": _spark_trace_scalar(layer._v_scale_float),
+                                "query_last": spark_trace_last_token_summary(
+                                    prefill_query
+                                ),
+                                "kv_cache_arg": _spark_tensor_trace_tuple_payload(
+                                    kv_cache_permute
+                                ),
+                                "kv_cache_sf": _spark_tensor_trace_tuple_payload(
+                                    kv_cache_sf
+                                ),
+                                "out_before": spark_trace_last_token_summary(
+                                    out_prefill
+                                ),
+                                "output_view": _spark_tensor_trace_view_payload(output),
+                                "out_target_view": _spark_tensor_trace_view_payload(
+                                    out_prefill_target
+                                ),
+                                "out_arg_view": _spark_tensor_trace_view_payload(
+                                    out_prefill
+                                ),
+                            },
+                        )
+
+                    if self.vo_split > 1:
+                        if self.is_kvcache_nvfp4:
+                            assert isinstance(kv_cache_permute, tuple)
+                            assert isinstance(kv_cache_sf, tuple)
+                        self._run_vo_split_prefill(
+                            prefill_wrapper,
+                            prefill_query,
+                            kv_cache_permute,
+                            kv_cache_sf,
+                            out_prefill,
+                            k_scale=layer._k_scale_float,
+                            v_scale=layer._v_scale_float,
+                        )
+                    else:
+                        prefill_wrapper.run(
+                            prefill_query,
+                            kv_cache_permute,
+                            k_scale=layer._k_scale_float,
+                            v_scale=layer._v_scale_float,
+                            out=out_prefill,
+                            kv_cache_sf=kv_cache_sf,
+                        )
+
+                    if (
+                        self.is_kvcache_nvfp4
+                        and self.use_fa2_nvfp4_kv
+                        and isinstance(prefill_wrapper, BatchPrefillWithPagedKVCacheWrapper)
+                        and spark_tensor_trace_should_emit(
+                            "flashinfer_wrapper_prefill_plan_run", layer_name
+                        )
+                    ):
+                        spark_tensor_trace(
+                            "flashinfer_wrapper_prefill_plan_run",
+                            {
+                                "layer_name": layer_name,
+                                "kv_cache_dtype": str(self.kv_cache_dtype),
+                                "window_left": int(self.window_left),
+                                "head_dim": int(self.head_size),
+                                "num_q_heads": int(self.num_heads),
+                                "num_kv_heads": int(self.num_kv_heads),
+                                "num_prefill_tokens": int(num_prefill_tokens),
+                                "num_decode_tokens": int(num_decode_tokens),
+                                "k_scale": _spark_trace_scalar(layer._k_scale_float),
+                                "v_scale": _spark_trace_scalar(layer._v_scale_float),
+                                "query": _spark_tensor_trace_view_payload(
+                                    prefill_query
+                                ),
+                                "kv_cache_arg": _spark_tensor_trace_tuple_payload(
+                                    kv_cache_permute
+                                ),
+                                "kv_cache_sf": _spark_tensor_trace_tuple_payload(
+                                    kv_cache_sf
+                                ),
+                                "out_arg": _spark_tensor_trace_view_payload(
+                                    out_prefill
+                                ),
+                                "wrapper_plan": _spark_trace_prefill_wrapper_payload(
+                                    prefill_wrapper
+                                ),
+                                "flashinfer_extra_cudaflags": os.environ.get(
+                                    "FLASHINFER_EXTRA_CUDAFLAGS", ""
+                                ),
+                            },
+                        )
+
+                    if (
+                        self.is_kvcache_nvfp4
+                        and self.use_fa2_nvfp4_kv
+                        # The replay re-plans with symmetric head dims, which
+                        # the VO-split wrapper deliberately does not use.
+                        and self.vo_split == 1
+                        and isinstance(prefill_wrapper, BatchPrefillWithPagedKVCacheWrapper)
+                        and isinstance(kv_cache_permute, tuple)
+                    ):
+                        self._spark_nvfp4_prefill_fresh_wrapper_replay(
+                            layer=layer,
+                            layer_name=layer_name,
+                            live_wrapper=prefill_wrapper,
+                            prefill_query=prefill_query,
+                            kv_cache_permute=kv_cache_permute,
+                            kv_cache_sf=kv_cache_sf
+                            if isinstance(kv_cache_sf, tuple)
+                            else None,
+                            live_out=out_prefill,
+                        )
+
+                    if (
+                        dump_out_before is not None
+                        and isinstance(prefill_wrapper, BatchPrefillWithPagedKVCacheWrapper)
+                    ):
+                        _spark_active_page_dump(
+                            event="prefill",
+                            layer_name=layer_name,
+                            query=prefill_query,
+                            out_before=dump_out_before,
+                            out_after=out_prefill,
+                            kv_data=kv_cache_permute
+                            if isinstance(kv_cache_permute, tuple)
+                            else None,
+                            kv_scales=kv_cache_sf
+                            if isinstance(kv_cache_sf, tuple)
+                            else None,
+                            wrapper=prefill_wrapper,
+                            k_scale=layer._k_scale_float,
+                            v_scale=layer._v_scale_float,
+                            window_left=self.window_left,
+                            num_prefill_tokens=num_prefill_tokens,
+                            num_decode_tokens=num_decode_tokens,
+                        )
+
+                    if spark_tensor_trace_should_emit(
+                        "flashinfer_wrapper_prefill_post", layer_name
+                    ):
+                        spark_tensor_trace(
+                            "flashinfer_wrapper_prefill_post",
+                            {
+                                "layer_name": layer_name,
+                                "kv_cache_dtype": str(self.kv_cache_dtype),
+                                "is_kvcache_nvfp4": bool(self.is_kvcache_nvfp4),
+                                "use_fa2_nvfp4_kv": bool(self.use_fa2_nvfp4_kv),
+                                "needs_fp8_out": bool(needs_fp8_out_prefill),
+                                "uses_contig_out": bool(uses_contig_out_prefill),
+                                "wrapper_type": type(prefill_wrapper).__name__,
+                                "window_left": int(self.window_left),
+                                "head_dim": int(self.head_size),
+                                "num_q_heads": int(self.num_heads),
+                                "num_kv_heads": int(self.num_kv_heads),
+                                "num_prefill_tokens": int(num_prefill_tokens),
+                                "num_decode_tokens": int(num_decode_tokens),
+                                "k_scale": _spark_trace_scalar(layer._k_scale_float),
+                                "v_scale": _spark_trace_scalar(layer._v_scale_float),
+                                "out_after": spark_trace_last_token_summary(
+                                    out_prefill
+                                ),
+                                "out_target_view": _spark_tensor_trace_view_payload(
+                                    out_prefill_target
+                                ),
+                                "out_arg_view": _spark_tensor_trace_view_payload(
+                                    out_prefill
+                                ),
+                            },
+                        )
 
                     if needs_fp8_out_prefill:
                         output[
                             num_decode_tokens : num_decode_tokens + num_prefill_tokens
                         ].copy_(out_prefill.to(output.dtype))
+                    elif uses_contig_out_prefill:
+                        out_prefill_target.copy_(out_prefill)
             else:
                 assert isinstance(attn_metadata.prefill, TRTLLMPrefill)
                 # prefill_query may be non-contiguous or have degenerate strides
@@ -1619,7 +2964,7 @@ class FlashInferImpl(AttentionImpl):
                     assert self.o_sf_scale is None
                     out = output[num_decode_tokens:]
 
-                # NVFP4 trtllm kernel only supports FP8 output.
+                # SM100 TRTLLM NVFP4 only supports FP8 output.
                 # Use a pre-allocated FP8 buffer and dequantize afterwards.
                 needs_fp8_out = self.is_kvcache_nvfp4 and output.dtype != FP8_DTYPE
                 if needs_fp8_out:
@@ -1693,6 +3038,10 @@ class FlashInferImpl(AttentionImpl):
                     ].copy_(out[:num_prefill_tokens].to(output.dtype))
 
         if num_decode_tokens > 0:
+            assert self.vo_split == 1, (
+                "NVFP4 VO split routes decodes through the prefill wrapper; "
+                "no tokens should reach the decode pathway."
+            )
             decode_query = query[:num_decode_tokens]
             assert decode_query.shape[0] == num_decode_tokens
 
@@ -1708,9 +3057,13 @@ class FlashInferImpl(AttentionImpl):
                     kv_cache_permute = nvfp4_kv_data
                 kv_cache_sf = nvfp4_kv_block_scales if self.is_kvcache_nvfp4 else None
 
-                # NVFP4 kernel only supports FP8 output.
-                # Use a pre-allocated FP8 buffer and dequantize afterwards.
-                needs_fp8_out = self.is_kvcache_nvfp4 and output.dtype != FP8_DTYPE
+                # SM100 TRTLLM NVFP4 only supports FP8 output. The SM12x FA2
+                # path writes model dtype directly.
+                needs_fp8_out = (
+                    self.is_kvcache_nvfp4
+                    and not self.use_fa2_nvfp4_kv
+                    and output.dtype != FP8_DTYPE
+                )
                 if needs_fp8_out:
                     out_decode = self._nvfp4_fp8_out[:num_decode_tokens]
                 else:
@@ -1742,6 +3095,40 @@ class FlashInferImpl(AttentionImpl):
                         get_dcp_group(),
                     )
                 else:
+                    if spark_tensor_trace_should_emit(
+                        "flashinfer_wrapper_decode_pre", layer_name
+                    ):
+                        spark_tensor_trace(
+                            "flashinfer_wrapper_decode_pre",
+                            {
+                                "layer_name": layer_name,
+                                "kv_cache_dtype": str(self.kv_cache_dtype),
+                                "is_kvcache_nvfp4": bool(self.is_kvcache_nvfp4),
+                                "use_fa2_nvfp4_kv": bool(self.use_fa2_nvfp4_kv),
+                                "needs_fp8_out": bool(needs_fp8_out),
+                                "wrapper_type": type(decode_wrapper).__name__,
+                                "window_left": int(self.window_left),
+                                "head_dim": int(self.head_size),
+                                "num_q_heads": int(self.num_heads),
+                                "num_kv_heads": int(self.num_kv_heads),
+                                "num_decode_tokens": int(num_decode_tokens),
+                                "k_scale": _spark_trace_scalar(layer._k_scale_float),
+                                "v_scale": _spark_trace_scalar(layer._v_scale_float),
+                                "query_last": spark_trace_last_token_summary(
+                                    decode_query
+                                ),
+                                "kv_cache_arg": _spark_tensor_trace_tuple_payload(
+                                    kv_cache_permute
+                                ),
+                                "kv_cache_sf": _spark_tensor_trace_tuple_payload(
+                                    kv_cache_sf
+                                ),
+                                "out_before": spark_trace_last_token_summary(
+                                    out_decode
+                                ),
+                            },
+                        )
+
                     decode_wrapper.run(
                         decode_query,
                         kv_cache_permute,
@@ -1750,6 +3137,31 @@ class FlashInferImpl(AttentionImpl):
                         out=out_decode,
                         kv_cache_sf=kv_cache_sf,
                     )
+
+                    if spark_tensor_trace_should_emit(
+                        "flashinfer_wrapper_decode_post", layer_name
+                    ):
+                        spark_tensor_trace(
+                            "flashinfer_wrapper_decode_post",
+                            {
+                                "layer_name": layer_name,
+                                "kv_cache_dtype": str(self.kv_cache_dtype),
+                                "is_kvcache_nvfp4": bool(self.is_kvcache_nvfp4),
+                                "use_fa2_nvfp4_kv": bool(self.use_fa2_nvfp4_kv),
+                                "needs_fp8_out": bool(needs_fp8_out),
+                                "wrapper_type": type(decode_wrapper).__name__,
+                                "window_left": int(self.window_left),
+                                "head_dim": int(self.head_size),
+                                "num_q_heads": int(self.num_heads),
+                                "num_kv_heads": int(self.num_kv_heads),
+                                "num_decode_tokens": int(num_decode_tokens),
+                                "k_scale": _spark_trace_scalar(layer._k_scale_float),
+                                "v_scale": _spark_trace_scalar(layer._v_scale_float),
+                                "out_after": spark_trace_last_token_summary(
+                                    out_decode
+                                ),
+                            },
+                        )
 
                 if needs_fp8_out:
                     output[:num_decode_tokens].copy_(out_decode.to(output.dtype))
@@ -1792,7 +3204,7 @@ class FlashInferImpl(AttentionImpl):
                     assert self.o_sf_scale is None
                     out = output[:num_decode_tokens]
 
-                # NVFP4 trtllm kernel only supports FP8 output.
+                # SM100 TRTLLM NVFP4 only supports FP8 output.
                 # Use a pre-allocated FP8 buffer and dequantize afterwards.
                 needs_fp8_out = self.is_kvcache_nvfp4 and output.dtype != FP8_DTYPE
                 if needs_fp8_out:
@@ -1828,6 +3240,26 @@ class FlashInferImpl(AttentionImpl):
 
                 if needs_fp8_out:
                     output[:num_decode_tokens].copy_(out.to(output.dtype))
+        if spark_tensor_trace_should_emit("flashinfer_attn_output", layer_name):
+            spark_tensor_trace(
+                "flashinfer_attn_output",
+                {
+                    "layer_name": layer_name,
+                    "kv_cache_dtype": str(self.kv_cache_dtype),
+                    "is_kvcache_nvfp4": bool(self.is_kvcache_nvfp4),
+                    "use_fa2_nvfp4_kv": bool(self.use_fa2_nvfp4_kv),
+                    "window_left": int(self.window_left),
+                    "head_dim": int(self.head_size),
+                    "num_q_heads": int(self.num_heads),
+                    "num_kv_heads": int(self.num_kv_heads),
+                    "num_actual_tokens": int(num_actual_tokens),
+                    "num_decodes": int(attn_metadata.num_decodes),
+                    "num_decode_tokens": int(num_decode_tokens),
+                    "num_prefills": int(attn_metadata.num_prefills),
+                    "num_prefill_tokens": int(num_prefill_tokens),
+                    "output_last": spark_trace_last_token_summary(output),
+                },
+            )
         return output_padded
 
     def do_kv_cache_update(
@@ -1848,6 +3280,34 @@ class FlashInferImpl(AttentionImpl):
             # actual tokens.
             k_cache = kv_cache[:, 0]
             v_cache = kv_cache[:, 1]
+            layer_name = _spark_kv_trace_layer_name(layer)
+            if _spark_kv_trace_should_emit("kv_write_pre", layer_name=layer_name):
+                _spark_kv_trace(
+                    "kv_write_pre",
+                    {
+                        "layer_name": layer_name,
+                        "kv_cache_dtype": str(self.kv_cache_dtype),
+                        "key_shape": list(key.shape),
+                        "key_stride": list(key.stride()),
+                        "key_dtype": str(key.dtype),
+                        "value_shape": list(value.shape),
+                        "value_stride": list(value.stride()),
+                        "value_dtype": str(value.dtype),
+                        "kv_cache_shape": list(kv_cache.shape),
+                        "kv_cache_stride": list(kv_cache.stride()),
+                        "kv_cache_dtype_actual": str(kv_cache.dtype),
+                        "k_cache_shape": list(k_cache.shape),
+                        "k_cache_stride": list(k_cache.stride()),
+                        "v_cache_shape": list(v_cache.shape),
+                        "v_cache_stride": list(v_cache.stride()),
+                        "slot_mapping_shape": list(slot_mapping.shape),
+                        "slot_mapping_head": _spark_kv_trace_tensor_head(
+                            slot_mapping
+                        ),
+                        "head_dim": int(self.head_size),
+                        "num_kv_heads": int(self.num_kv_heads),
+                    },
+                )
             torch.ops._C_cache_ops.reshape_and_cache_flash(
                 key,
                 value,
@@ -1858,6 +3318,37 @@ class FlashInferImpl(AttentionImpl):
                 layer._k_scale,
                 layer._v_scale,
             )
+            if self.is_kvcache_nvfp4 and _spark_kv_trace_should_emit(
+                "kv_write_post_nvfp4", layer_name=layer_name
+            ):
+                stride_order = FlashInferBackend.get_kv_cache_stride_order()
+                kv_cache_permute = kv_cache.permute(*stride_order)
+                data_views, scale_views = nvfp4_kv_cache_split_views(kv_cache_permute)
+                page_size = int(kv_cache_permute.shape[2])
+                _spark_kv_trace(
+                    "kv_write_post_nvfp4",
+                    {
+                        "layer_name": layer_name,
+                        "kv_cache_dtype": str(self.kv_cache_dtype),
+                        "kv_cache_shape": list(kv_cache.shape),
+                        "kv_cache_stride": list(kv_cache.stride()),
+                        "kv_cache_permute_shape": list(kv_cache_permute.shape),
+                        "kv_cache_permute_stride": list(kv_cache_permute.stride()),
+                        "data_views": _spark_kv_trace_views_info(data_views),
+                        "scale_views": _spark_kv_trace_views_info(scale_views),
+                        "slot_mapping_head": _spark_kv_trace_tensor_head(
+                            slot_mapping
+                        ),
+                        "slot_samples": _spark_kv_trace_slot_samples(
+                            data_views,
+                            scale_views,
+                            slot_mapping,
+                            page_size,
+                        ),
+                        "head_dim": int(self.head_size),
+                        "num_kv_heads": int(self.num_kv_heads),
+                    },
+                )
 
 
 def fast_plan_decode(

@@ -18,6 +18,7 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    KVQuantMode,
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -166,6 +167,22 @@ def _allocate_kv_cache(
     return kv_cache_raw_tensors
 
 
+def _group_cache_dtype_str(kv_cache_spec: KVCacheSpec, cache_dtype: str) -> str:
+    """Resolve the kv_cache_dtype string for one KV cache group.
+
+    With per-layer mixed KV dtypes (kv_cache_dtype_skip_layers overrides),
+    the global cache_config.cache_dtype no longer describes every group: a
+    skipped/unquantized group must resolve to "auto" rather than inherit
+    e.g. "nvfp4" and get a packed cache shape for an unpacked tensor.
+    """
+    spec_dtype_str = getattr(kv_cache_spec, "cache_dtype_str", None)
+    if spec_dtype_str is not None:
+        return spec_dtype_str
+    if getattr(kv_cache_spec, "kv_quant_mode", KVQuantMode.NONE) == KVQuantMode.NONE:
+        return "auto"
+    return cache_dtype
+
+
 def _reshape_kv_cache(
     attn_groups: Sequence[AttentionGroup],
     kv_cache_raw_tensors: dict[str, torch.Tensor],
@@ -211,7 +228,9 @@ def _reshape_kv_cache(
                     kernel_block_size,
                     kv_cache_spec.num_kv_heads,
                     kv_cache_spec.head_size,
-                    cache_dtype_str=cache_dtype,
+                    cache_dtype_str=_group_cache_dtype_str(
+                        kv_cache_spec, cache_dtype
+                    ),
                 )
 
                 # FIXME(woosuk): Add kv_cache_stride_order to all attention backends.
@@ -308,7 +327,7 @@ def _update_hybrid_attention_layout(
             kernel_block_sizes[group.kv_cache_group_id],
             kv_cache_spec.num_kv_heads,
             kv_cache_spec.head_size,
-            cache_dtype_str=cache_dtype,
+            cache_dtype_str=_group_cache_dtype_str(kv_cache_spec, cache_dtype),
         )
         # if the first dim of the kvcache's layout is already num_blocks, continue
         if block_dim == 0:

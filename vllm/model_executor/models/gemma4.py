@@ -489,6 +489,38 @@ class Gemma4Attention(nn.Module):
             is_neox_style=True,
         )
 
+        # Per-layer mixed KV (quantized cache_dtype + skip-layers fallback):
+        # global D>256 layers must be pinned to a head-size-capable backend.
+        # The selector's validate_configuration accepts head_size=512 for
+        # FlashInfer, but its FA2 kernel rejects it at run time (trait guard
+        # in prefill.cuh, dtype-independent — probed on GB10), so automatic
+        # per-layer fallback does not happen and the pin must be explicit.
+        # Full-NVFP4 alternative (no skip layers): VLLM_NVFP4_KV_VOSPLIT=1
+        # keeps these layers on FlashInfer via the two-pass VO split;
+        # mixed_kv_requested is then False, so no pin happens here.
+        # VLLM_FLASHINFER_VOSPLIT=1 (any-dtype VO split) likewise
+        # supersedes the pin: FlashInfer handles head_dim > 256 directly.
+        attn_backend_override = None
+        mixed_kv_requested = (
+            cache_config is not None
+            and cache_config.cache_dtype != "auto"
+            and bool(cache_config.kv_cache_dtype_skip_layers)
+        )
+        import os
+
+        vosplit_all_dtypes = os.environ.get(
+            "VLLM_FLASHINFER_VOSPLIT", ""
+        ) not in ("", "0")
+        if (
+            mixed_kv_requested
+            and not vosplit_all_dtypes
+            and not self.is_sliding
+            and self.head_dim > 256
+        ):
+            from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+            attn_backend_override = AttentionBackendEnum.TRITON_ATTN.get_class()
+
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -499,6 +531,7 @@ class Gemma4Attention(nn.Module):
             logits_soft_cap=attn_logits_soft_cap,
             per_layer_sliding_window=sliding_window,
             kv_sharing_target_layer_name=kv_sharing_target_layer_name,
+            attn_backend=attn_backend_override,
             prefix=f"{prefix}.attn",
         )
 
