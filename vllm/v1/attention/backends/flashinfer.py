@@ -695,6 +695,69 @@ def _vllm_flashinfer_bf16_gemma_vo_split_enabled() -> bool:
     )
 
 
+def _vllm_flashinfer_mm_prefix_requested() -> bool:
+    """VLLM_FLASHINFER_MM_PREFIX lets the FlashInfer backend serve
+    mm-prefix LMs (Gemma 3 / Gemma 4 multimodal): image-token spans
+    attend bidirectionally via FA2 packed custom masks on a second
+    prefill wrapper, retiring the Triton mm fallback on CC 12.x.
+
+    DEFAULT-ON since the Amendment 4 flip (OVERNIGHT_LADDER_PLAN
+    2026-06-12): only "0" disables (escape hatch). The default's effect
+    is scoped to Gemma 3/4 mm archs on CC 12.x devices via
+    _vllm_flashinfer_mm_prefix_enabled() and to probe-validated KV
+    dtypes via supports_combination; explicitly setting =1 keeps the
+    pre-flip opt-in semantics (any CC, any mm-prefix arch, any KV
+    dtype)."""
+    return os.environ.get("VLLM_FLASHINFER_MM_PREFIX", "1") != "0"
+
+
+def _vllm_flashinfer_mm_prefix_explicit() -> bool:
+    """True only when the user explicitly set VLLM_FLASHINFER_MM_PREFIX
+    to an enabling value (the pre-flip opt-in). Distinguished from the
+    default-on state so the Amendment 4 flip changes ONLY knob-unset
+    Gemma-mm behavior on CC 12.x: explicit opt-in keeps its pre-flip
+    scope (any CC / any mm-prefix arch / any KV dtype), while the
+    default never widens beyond the validated cells."""
+    return os.environ.get("VLLM_FLASHINFER_MM_PREFIX", "") not in ("", "0")
+
+
+def _flashinfer_mm_prefix_gemma_arch(model_config) -> bool:
+    """The model archs whose mm-prefix masking policy is implemented and
+    validated on this backend: Gemma 3 (spans mask every layer group)
+    and Gemma 4 (use_bidirectional_attention='vision': sliding groups
+    only; globals stay causal). Other mm-prefix archs (bagel / molmo2 /
+    moondream3 / paligemma / umm) keep upstream routing under the
+    default-on knob; explicit =1 opts them in (pre-flip semantics)."""
+    if model_config is None:
+        return False
+    architectures = getattr(model_config, "architectures", None) or []
+    return any(arch.startswith(("Gemma3", "Gemma4")) for arch in architectures)
+
+
+def _vllm_flashinfer_mm_prefix_enabled(model_config) -> bool:
+    """Scoped mm-prefix enablement (the Amendment 4 default flip):
+
+    - "0": disabled (escape hatch; mm spans keep the upstream
+      Triton-capable routing);
+    - explicit "1": enabled, pre-flip opt-in semantics (any CC, any
+      mm-prefix arch);
+    - unset (default-on): enabled only for Gemma 3/4 mm archs on
+      CC 12.x devices, so the flip can leak neither to non-12.x CCs nor
+      to mm-prefix archs whose masking policy was never validated here.
+
+    Used by both the selection-time supports_mm_prefix() gate and the
+    builder's mm_prefix_enabled so the two can never disagree (a
+    disagreement would either hard-fail startup or silently serve image
+    spans causally)."""
+    if not _vllm_flashinfer_mm_prefix_requested():
+        return False
+    if _vllm_flashinfer_mm_prefix_explicit():
+        return True
+    return current_platform.is_device_capability_family(
+        120
+    ) and _flashinfer_mm_prefix_gemma_arch(model_config)
+
+
 def _vo_split_factor(head_size: int, is_fa2_nvfp4: bool) -> int:
     """Number of VO passes for the FlashInfer FA2 path.
 
@@ -1188,7 +1251,26 @@ class FlashInferBackend(AttentionBackend):
         TRTLLM kernels whose head-512 support we have not probed, so
         upstream behavior there is left untouched (the over-promise is
         documented in the campaign's draft upstream issue instead).
+
+        Additionally scopes the Amendment 4 default-on mm-prefix flip by
+        KV dtype: the default vouches only for the KV dtypes the
+        custom-mask path was probe/serving-validated on (bf16/"auto" and
+        NVFP4). fp8 KV mm spans keep upstream routing unless
+        VLLM_FLASHINFER_MM_PREFIX=1 is set explicitly.
         """
+        if (
+            use_mm_prefix
+            and device_capability.major == 12
+            and _vllm_flashinfer_mm_prefix_requested()
+            and not _vllm_flashinfer_mm_prefix_explicit()
+            and kv_cache_dtype not in (None, "auto", "bfloat16", "nvfp4")
+        ):
+            return (
+                "mm-prefix custom masks are default-enabled only for "
+                "bf16/'auto'/nvfp4 KV on CC 12.x; set "
+                "VLLM_FLASHINFER_MM_PREFIX=1 explicitly to serve mm "
+                f"spans with {kv_cache_dtype} KV"
+            )
         if device_capability.major != 12 or head_size <= 256:
             return None
         vosplit_all = _vllm_flashinfer_vosplit_requested()
@@ -1237,10 +1319,25 @@ class FlashInferBackend(AttentionBackend):
     def supports_mm_prefix(cls) -> bool:
         """mm-prefix LMs (Gemma 3 / Gemma 4 multimodal: image-token spans
         attend bidirectionally) are served via FA2 packed custom masks on
-        the FI-native prefill path, knob-gated for the spark-hijinks
-        campaign. Decode is untouched: spans live in the prompt, so decode
-        queries are strictly causal."""
-        return envs.VLLM_FLASHINFER_MM_PREFIX
+        the FI-native prefill path. Decode is untouched: spans live in
+        the prompt, so decode queries are strictly causal.
+
+        DEFAULT-ON for Gemma 3/4 mm archs on CC 12.x devices (the
+        Amendment 4 flip); VLLM_FLASHINFER_MM_PREFIX=0 disables, explicit
+        =1 claims support unconditionally (pre-flip opt-in semantics).
+        This classmethod gets no model argument, so the default path
+        reads the current model from the selection-time vllm config; no
+        config in scope means the default does not vouch (conservative:
+        upstream behavior)."""
+        if not _vllm_flashinfer_mm_prefix_requested():
+            return False
+        if _vllm_flashinfer_mm_prefix_explicit():
+            return True
+        from vllm.config import get_current_vllm_config_or_none
+
+        vllm_config = get_current_vllm_config_or_none()
+        model_config = vllm_config.model_config if vllm_config is not None else None
+        return _vllm_flashinfer_mm_prefix_enabled(model_config)
 
     @classmethod
     def supports_sink(cls) -> bool:
@@ -1607,10 +1704,15 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # equivalent of gemma4_mm._clear_mm_prefix_for_full_attn_layers,
         # decided here at build time because FlashInfer bakes masks into
         # wrapper plans). Gemma3 applies the spans to all layers.
+        # _vllm_flashinfer_mm_prefix_enabled carries the Amendment 4
+        # default-flip scoping and is the SAME gate supports_mm_prefix
+        # uses at selection time, so builder and selector cannot
+        # disagree (a builder-side False with a selector-side True would
+        # silently serve image spans causally).
         self.mm_prefix_enabled = (
-            envs.VLLM_FLASHINFER_MM_PREFIX
-            and self.model_config is not None
+            self.model_config is not None
             and self.model_config.is_mm_prefix_lm
+            and _vllm_flashinfer_mm_prefix_enabled(self.model_config)
         )
         if self.mm_prefix_enabled:
             bidi_mode = getattr(
@@ -1623,7 +1725,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             if self.use_dcp:
                 raise NotImplementedError(
                     "FlashInfer mm-prefix custom masks are not wired for "
-                    "DCP; unset VLLM_FLASHINFER_MM_PREFIX or disable DCP."
+                    "DCP; set VLLM_FLASHINFER_MM_PREFIX=0 or disable DCP."
                 )
         if self.mm_prefix_enabled:
             logger.info_once(
@@ -2034,6 +2136,24 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 # The mask carries causal/SW/span composition wholesale.
                 group_causal = False
                 group_window_left = -1
+                num_mm_reqs = int(req_indices.numel())
+                num_spans = sum(
+                    len(prefill_mm_spans[i]) for i in req_indices.tolist()
+                )
+                # Serving-proof line (banked by the mm retirement smokes):
+                # first custom-mask batch at INFO, every batch at DEBUG.
+                logger.info_once(
+                    "FlashInfer mm-prefix: first custom-mask prefill batch "
+                    "planned (%d mm request(s), %d image span(s) in-window).",
+                    num_mm_reqs,
+                    num_spans,
+                )
+                logger.debug(
+                    "FlashInfer mm-prefix batch: %d mm request(s), "
+                    "%d span(s) in-window.",
+                    num_mm_reqs,
+                    num_spans,
+                )
             else:
                 maybe_wrapper = self._get_prefill_wrapper()
                 assert isinstance(

@@ -199,7 +199,7 @@ if TYPE_CHECKING:
     VLLM_NVFP4_KV_VOSPLIT: bool = False
     VLLM_FLASHINFER_VOSPLIT: bool = False
     VLLM_FLASHINFER_BF16_GEMMA: bool = True
-    VLLM_FLASHINFER_MM_PREFIX: bool = False
+    VLLM_FLASHINFER_MM_PREFIX: bool = True
     VLLM_XGRAMMAR_CACHE_MB: int = 0
     VLLM_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
     VLLM_ALLOW_INSECURE_SERIALIZATION: bool = False
@@ -1670,8 +1670,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # packed custom masks on a second prefill wrapper; text requests
     # stay on the fast causal path. Lifts the is_mm_prefix_lm backend
     # rejection without requiring --language-model-only.
-    "VLLM_FLASHINFER_MM_PREFIX": lambda: os.getenv("VLLM_FLASHINFER_MM_PREFIX", "")
-    not in ("", "0"),
+    # DEFAULT-ON since the Amendment 4 flip (OVERNIGHT_LADDER_PLAN
+    # 2026-06-12): only the value "0" disables (escape hatch). The
+    # default's effect is scoped at the consumption sites to Gemma 3/4
+    # mm archs on CC 12.x devices and to probe-validated KV dtypes
+    # (bf16/"auto"/nvfp4); explicitly setting =1 keeps the pre-flip
+    # opt-in semantics (any CC, any mm-prefix arch, any KV dtype).
+    "VLLM_FLASHINFER_MM_PREFIX": lambda: os.getenv("VLLM_FLASHINFER_MM_PREFIX", "1")
+    != "0",
     # Control the maximum number of tokens per expert supported by the
     # NVFP4 MoE CUTLASS Kernel. This value is used to create a buffer for
     # the blockscale tensor of activations NVFP4 Quantization.

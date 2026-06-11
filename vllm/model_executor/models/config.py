@@ -68,7 +68,12 @@ def _spark_route_gemma_bf16_to_flashinfer(
     - the user has not chosen a backend explicitly,
     - the device is CC 12.x (sm_120/121: DGX Spark GB10, RTX 50xx),
     - the KV cache dtype is bf16 ("auto"/"bfloat16" — quantized-KV
-      configs keep their own routes/knobs).
+      configs keep their own routes/knobs),
+    - multimodal prefix spans are servable: since the Amendment 4 flip
+      mm-prefix Gemma routes too BY DEFAULT (spans run on the FlashInfer
+      FA2 custom-mask path); VLLM_FLASHINFER_MM_PREFIX=0 stands the
+      route down for mm models (spans keep the upstream Triton-capable
+      backend).
 
     Uniform-256 models (Gemma 3) run plain FlashInfer FA2; heterogeneous
     256/512 models (Gemma 4) run global D=512 layers through the exact
@@ -99,26 +104,35 @@ def _spark_route_gemma_bf16_to_flashinfer(
     ):
         return False
     model_config = vllm_config.model_config
-    if (
-        model_config is not None
-        and getattr(model_config, "is_mm_prefix_lm", False)
-        and os.environ.get("VLLM_FLASHINFER_MM_PREFIX", "") in ("", "0")
-    ):
-        # Multimodal Gemma needs bidirectional image-token spans, which
-        # FlashInfer only serves with VLLM_FLASHINFER_MM_PREFIX=1
-        # (Triton supports them natively). Forcing FLASHINFER here
-        # would make backend validation fail at startup, so leave the
-        # upstream route alone and say how to opt in fully.
+    if model_config is not None and getattr(model_config, "is_mm_prefix_lm", False):
+        if os.environ.get("VLLM_FLASHINFER_MM_PREFIX", "1") == "0":
+            # Escape hatch (inverts the pre-Amendment-4 mm guard): with
+            # the mm knob explicitly disabled, FlashInfer cannot serve
+            # the bidirectional image-token spans, so forcing FLASHINFER
+            # here would make backend validation fail at startup. Leave
+            # the upstream (Triton-capable) route alone and log the
+            # decision — no hard-fail either way.
+            logger.info(
+                "Gemma bf16 FlashInfer routing is enabled "
+                "(VLLM_FLASHINFER_BF16_GEMMA) but %s serves multimodal "
+                "prefix spans and VLLM_FLASHINFER_MM_PREFIX=0 is set: "
+                "not routing; mm spans keep the upstream "
+                "(Triton-capable) backend. Unset VLLM_FLASHINFER_MM_PREFIX "
+                "to retire the Triton mm fallback.",
+                family,
+            )
+            return False
+        # Amendment 4 (OVERNIGHT_LADDER_PLAN 2026-06-12): mm-prefix spans
+        # route to the FlashInfer FA2 custom-mask path BY DEFAULT on
+        # CC 12.x (this route is already CC-scoped above). Gemma 3 masks
+        # every layer group; Gemma 4 ('vision' policy) masks sliding
+        # groups only. Serving-proof line for the smoke gates:
         logger.info(
-            "Gemma bf16 FlashInfer routing is enabled "
-            "(VLLM_FLASHINFER_BF16_GEMMA, default-on) but %s serves "
-            "multimodal prefix spans, which FlashInfer needs "
-            "VLLM_FLASHINFER_MM_PREFIX=1 for; not routing. Set that knob "
-            "too (or --language-model-only for text-only serving) to "
-            "retire the Triton fallback.",
+            "%s multimodal prefix spans will run on the FlashInfer FA2 "
+            "custom-mask path (VLLM_FLASHINFER_MM_PREFIX, default-on; "
+            "set =0 to keep the Triton mm route).",
             family,
         )
-        return False
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
     vllm_config.attention_config.backend = AttentionBackendEnum.FLASHINFER
