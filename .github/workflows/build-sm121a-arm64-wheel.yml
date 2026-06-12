@@ -1,0 +1,175 @@
+# dgx-spark-hijinks campaign: CI sm_121a aarch64 vLLM wheel for Spark-class ARM hosts.
+#
+# This workflow is intentionally manual-only while the first x64/sm_120a build
+# is still being shaken out. It runs on Ubicloud arm64 so no local CPU or Spark
+# window is spent compiling.
+
+name: build-sm121a-arm64-wheel
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag_suffix:
+        description: "Optional suffix appended to the release tag (e.g. -retry1)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write # gh release create
+
+concurrency:
+  group: build-sm121a-arm64-wheel-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TORCH_VERSION: "2.12.0"
+  TORCH_INDEX_URL: "https://download.pytorch.org/whl/cu130"
+  CUDA_HOME: /usr/local/cuda-13.0
+
+jobs:
+  build-wheel:
+    runs-on: ubicloud-standard-30-arm
+    timeout-minutes: 355
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Runner inventory
+        run: |
+          set -euxo pipefail
+          uname -a
+          dpkg --print-architecture
+          lscpu | sed -n '1,24p'
+          nproc
+          free -h
+          df -h /
+
+      - name: Free disk space
+        run: |
+          set -x
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      /usr/local/.ghcup /usr/share/swift || true
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install CUDA 13.0 toolkit (Ubuntu 24.04 SBSA repo)
+        run: |
+          set -euxo pipefail
+          source /etc/os-release
+          UBREPO="ubuntu$(echo "${VERSION_ID}" | tr -d .)"
+          wget -q "https://developer.download.nvidia.com/compute/cuda/repos/${UBREPO}/sbsa/cuda-keyring_1.1-1_all.deb" -O /tmp/cuda-keyring.deb
+          sudo dpkg -i /tmp/cuda-keyring.deb
+          sudo apt-get -qq update
+          sudo apt-get -qq install -y cuda-toolkit-13-0 ccache
+          ${CUDA_HOME}/bin/nvcc --version
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/ccache
+          key: sm121a-arm64-ccache-${{ github.sha }}
+          restore-keys: |
+            sm121a-arm64-ccache-
+
+      - name: Install torch cu130 + build requirements
+        run: |
+          set -euxo pipefail
+          python -VV
+          pip install "torch==${TORCH_VERSION}" --index-url "${TORCH_INDEX_URL}"
+          python use_existing_torch.py
+          pip install -r requirements/build/cuda.txt
+          python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda, 'arch', __import__('platform').machine())"
+
+      - name: Build sm_121a arm64 wheel
+        id: build
+        timeout-minutes: 320
+        continue-on-error: true
+        env:
+          TORCH_CUDA_ARCH_LIST: "12.1a"
+          VLLM_MAIN_CUDA_VERSION: "13.0"
+          VLLM_TARGET_DEVICE: cuda
+          MAX_JOBS: "20"
+          NVCC_THREADS: "1"
+          CMAKE_BUILD_PARALLEL_LEVEL: "20"
+          CMAKE_C_COMPILER_LAUNCHER: ccache
+          CMAKE_CXX_COMPILER_LAUNCHER: ccache
+          CMAKE_CUDA_COMPILER_LAUNCHER: ccache
+          CCACHE_MAXSIZE: 20G
+        run: |
+          set -euxo pipefail
+          export PATH="${CUDA_HOME}/bin:${PATH}"
+          SHORTSHA="$(git rev-parse --short=9 HEAD)"
+          export VLLM_VERSION_OVERRIDE="0.1.dev1+g${SHORTSHA}.sm121a.arm64"
+          export SETUPTOOLS_SCM_PRETEND_VERSION="${VLLM_VERSION_OVERRIDE}"
+          ccache --zero-stats || true
+          pip wheel --no-build-isolation --no-deps -w dist . -v
+          ccache --show-stats || true
+          ls -la dist/
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/ccache
+          key: sm121a-arm64-ccache-${{ github.sha }}
+
+      - name: Require wheel
+        run: |
+          set -euxo pipefail
+          ls dist/vllm-*.whl || {
+            echo "::error::No wheel produced. Re-run this workflow to reuse ccache."
+            exit 1
+          }
+
+      - name: Sanity - wheel metadata + sm_121a cubin audit
+        run: |
+          set -euxo pipefail
+          WHEEL="$(ls dist/vllm-*.whl)"
+          mkdir -p /tmp/wheel_audit
+          unzip -q "${WHEEL}" -d /tmp/wheel_audit
+          find /tmp/wheel_audit -name METADATA -path "*dist-info*" | head -1 | xargs sed -n '1,12p'
+          FAIL=0
+          for so in $(find /tmp/wheel_audit -name "_C*.abi3.so" -o -name "_moe_C*.abi3.so" -o -name "_vllm_fa2_C*.abi3.so" -o -name "_vllm_fa3_C*.abi3.so"); do
+            echo "--- ${so}"
+            ${CUDA_HOME}/bin/cuobjdump -lelf "${so}" > /tmp/cuobj.txt 2>&1 || { echo "(no ELF payload)"; continue; }
+            grep -oE 'sm_[0-9]+a?' /tmp/cuobj.txt | sort | uniq -c
+            grep -q 'sm_121a' /tmp/cuobj.txt || { echo "::error::${so} contains no sm_121a cubins"; FAIL=1; }
+          done
+          test "${FAIL}" = "0"
+
+      - name: Upload wheel as Actions artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vllm-sm121a-arm64-wheel-${{ github.sha }}
+          path: dist/vllm-*.whl
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euxo pipefail
+          SHORTSHA="$(git rev-parse --short=9 HEAD)"
+          TAG="sm121a-arm64-wheels-${SHORTSHA}${{ inputs.release_tag_suffix || '' }}"
+          WHEEL="$(ls dist/vllm-*.whl)"
+          NOTES="sm_121a (CC 12.1, GB10 / DGX Spark class) arm64 vLLM wheel.
+          Source: ${{ github.ref_name }} @ ${{ github.sha }}
+          Toolchain: nvcc 13.0 (Ubuntu 24.04 SBSA repo), torch ${TORCH_VERSION}+cu130, TORCH_CUDA_ARCH_LIST=12.1a, python 3.12."
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" "${WHEEL}" --clobber
+          else
+            gh release create "${TAG}" "${WHEEL}" \
+              --title "sm121a arm64 wheels @ ${SHORTSHA}" \
+              --notes "${NOTES}" \
+              --target "${{ github.sha }}"
+          fi
+          echo "RELEASE_URL=https://github.com/${{ github.repository }}/releases/tag/${TAG}" | tee -a "${GITHUB_STEP_SUMMARY}"
