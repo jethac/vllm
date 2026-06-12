@@ -2,7 +2,8 @@
 #
 # This workflow runs on Ubicloud arm64 so no local CPU or Spark window is spent
 # compiling. It is intentionally separate from the x64 sm_120a workflow so both
-# builds can run in parallel.
+# builds can run in parallel. This file has a path-scoped push trigger so a
+# workflow-only touch can launch arm64 without duplicating the x64 build.
 
 name: build-sm121a-arm64-wheel
 
