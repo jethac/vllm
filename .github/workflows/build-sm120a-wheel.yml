@@ -40,6 +40,8 @@ on:
   push:
     branches:
       - spark/hijinks-e2-vllm
+    paths-ignore:
+      - ".github/workflows/build-sm121a-arm64-wheel.yml"
   workflow_dispatch:
     inputs:
       release_tag_suffix:
