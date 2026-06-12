@@ -1,0 +1,70 @@
+# dgx-spark-hijinks: self-contained Spark-ready vLLM serving image.
+#
+# WHY: bare wheels need a host whose glibc/torch match the build env; injecting a
+# 24.04/glibc-2.38/torch-2.12 wheel into Spark's 22.04/glibc-2.35/torch-2.11
+# containers fails (undefined symbols / GLIBC_2.38 not found). This image bakes a
+# SINGLE consistent stack -- Ubuntu 24.04 (glibc 2.39) + CUDA 13 cu130 + torch
+# 2.12 + the e2-dgv vLLM wheel + the campaign FlashInfer source (runtime JIT) +
+# the transformers pin -- so the wheel loads natively and it runs AS-IS on GB10 /
+# DGX Spark (the host supplies only the driver via nvidia-container-runtime).
+#
+# Built on Ubicloud arm64 (no Spark/GPU build); see build-spark-image.yml.
+
+ARG CUDA_BASE=nvidia/cuda:13.0.1-devel-ubuntu24.04
+FROM ${CUDA_BASE}
+
+ARG TORCH_VERSION=2.12.0
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu130
+ARG VLLM_WHEEL=vllm.whl
+ARG FLASHINFER_REPO=https://github.com/jethac/flashinfer.git
+ARG FLASHINFER_REF=3fa0775c
+ARG TRANSFORMERS_PIN=5.11.0
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+ENV PIP_NO_CACHE_DIR=1
+
+# python 3.12 (matches the cp312 wheel) + flashinfer JIT toolchain (ninja, git)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3.12 python3.12-dev python3-pip git wget ca-certificates ninja-build \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.12 /usr/local/bin/python3 \
+    && ln -sf /usr/bin/python3.12 /usr/local/bin/python
+
+# torch 2.12 cu130 FIRST so the wheel + its deps resolve against it (not CPU torch)
+RUN python -m pip install "torch==${TORCH_VERSION}" --index-url "${TORCH_INDEX_URL}"
+
+# the e2-dgv vLLM wheel (glibc-2.39 base >= wheel's 2.38; torch ABI matches).
+# install WITH deps so vLLM's runtime requirements come in; the already-present
+# torch 2.12 satisfies its torch pin so pip won't swap it.
+COPY ${VLLM_WHEEL} /tmp/vllm.whl
+RUN python -m pip install /tmp/vllm.whl && rm /tmp/vllm.whl
+
+# transformers pin LAST -- gemma4_unified (G4-12B + DiffusionGemma) -- overriding
+# whatever vLLM's deps pulled.
+RUN python -m pip install "transformers==${TRANSFORMERS_PIN}"
+
+# campaign FlashInfer source tree: runtime JIT against this image's nvcc. The fork
+# carries the data/* symlinks (csrc/include/cutlass/spdlog/cccl) for raw-clone JIT.
+RUN git clone "${FLASHINFER_REPO}" /opt/jethac-flashinfer \
+    && git -C /opt/jethac-flashinfer checkout "${FLASHINFER_REF}"
+
+ENV PYTHONPATH=/opt/jethac-flashinfer
+ENV CUDA_HOME=/usr/local/cuda
+ENV FLASHINFER_EXTRA_CUDAFLAGS="-DFLASHINFER_PAGED_V_SF_DESWIZZLE=1"
+# VO-split knobs gate DiffusionGemma's FLASHINFER allowance + the D=512 two-pass
+ENV VLLM_FLASHINFER_VOSPLIT=1
+ENV VLLM_NVFP4_KV_VOSPLIT=1
+
+# build-time provenance (GPU-free: no driver during docker build, so DON'T import
+# the CUDA extensions here -- the real import+registration probe runs post-pull on
+# Spark). Assert: wheel installed, transformers pinned, flashinfer + model present.
+RUN python -m pip show vllm | grep -iE "^Version" \
+ && python -c "import transformers; assert transformers.__version__.startswith('5.11'), transformers.__version__; print('transformers', transformers.__version__)" \
+ && test -f /opt/jethac-flashinfer/flashinfer/__init__.py \
+ && python -c "import importlib.util as u; assert u.find_spec('vllm.model_executor.models.diffusion_gemma'), 'diffusion_gemma module missing'; print('diffusion_gemma module present')"
+
+WORKDIR /workspace
+# sleeping container by default (docker exec the serve cmd), matching the campaign
+# pattern; override CMD with `vllm serve ...` for a one-shot serve container.
+CMD ["/bin/bash", "-lc", "sleep infinity"]
