@@ -27,15 +27,17 @@ arch, any KV dtype). The DEFAULT is scoped to Gemma 3/4 mm archs on
 CC 12.x and to probe-validated KV dtypes (bf16/"auto"/nvfp4); fp8-KV mm
 spans, non-Gemma mm archs and non-12.x CCs keep upstream behavior.
 
-SCOPING FIX (2026-06-12): the default flip is scoped to the GEMMA 4
-FAMILY ONLY. Gemma 3 knob-unset cells revert to pre-flip expectations
-(upstream routing, FLASH_ATTN where supported): on sm_120 at Gemma 3 1B
-geometry (d256, SWA window 512) FlashInfer is numerically wrong for
-every KV dtype (results/p520_gemma3_1b_serving_20260612/), so the
-default routing Gemma 3 onto it was a regression. Explicit =1 still
-opts Gemma 3 in for experiments (known-broken on sm_120, pending the
-FlashInfer root-cause fix). Backend-side cells (selector honesty,
-_vo_split_factor) are head>256 — Gemma 4 geometry — and unchanged.
+RE-FLIP (2026-06-12, later same day): Gemma 3 bf16 default-on is
+RESTORED. The earlier scope-out rested on a sm_120 "FlashInfer wrong at
+d256/SWA-512" finding that was REFUTED as a WSL2/WDDM false-green
+artifact: the rigorous P520 1B re-test (backend verified engaged, util
+0.6) gave FI-bf16 -0.0007 nats vs FLASH_ATTN, clean, no wedge,
+reconciled with 270M (+0.00133) and Spark sm_121 (+0.00279)
+(results/p520_g3_1b_retest_20260612/). So knob-unset bf16 Gemma 3
+retires Triton -> FLASHINFER on CC 12.x exactly like Gemma 4; only "0"
+disables. The separate sm_120 nvfp4-KV read defect is an nvfp4 issue,
+not bf16 routing, and does not gate this. Backend-side cells (selector
+honesty, _vo_split_factor) are head>256 — Gemma 4 geometry — unchanged.
 
 Everything runs under a mocked platform/capability; no CUDA required.
 """
@@ -309,35 +311,33 @@ class TestGemma4Routing:
 
 class TestGemma3Routing:
     @pytest.mark.parametrize("capability", [CC12_0, CC12_1])
-    def test_default_leaves_backend_unset(self, fake_cc, capability):
-        """REVERTED to the pre-flip expectation by the 2026-06-12 scoping
-        fix — WHY: on sm_120 at Gemma 3 1B geometry (d256, SWA window
-        512) FlashInfer is numerically wrong for EVERY KV dtype: FI-bf16
-        is +0.221/+1.243/+1.380 nats off an HF-reference/FLASH_ATTN pair
-        that agree to <0.001, and FI-nvfp4 emits deterministic gibberish
-        on a virgin JIT cache (results/p520_gemma3_1b_serving_20260612/
-        + ledger). The Amendment 3 default briefly routed knob-unset
-        Gemma 3 bf16 onto FlashInfer here — a regression off the correct
-        FLASH_ATTN default — so knob-unset Gemma 3 must leave the
-        backend unset for upstream priority order on ALL CC 12.x
-        (sm_121 is corroborated fine, but the default must not regress
-        sm_120). Re-flip is gated on the FlashInfer d256/SWA root cause
-        plus a green truth-referenced rerun."""
+    def test_default_routes_flashinfer(self, fake_cc, capability):
+        """RE-FLIPPED default-on (2026-06-12): the prior scoping-out of
+        Gemma 3 rested on a sm_120 "FlashInfer numerically wrong at
+        d256/SWA-512" finding that was REFUTED as a WSL2/WDDM false-green
+        artifact. The rigorous P520 1B re-test (backend verified engaged,
+        util 0.6) gave FI-bf16 2.35719 vs FLASH_ATTN 2.35785 = -0.0007
+        nats, clean, no engine wedge; reconciled with 270M (+0.00133) and
+        Spark sm_121 (+0.00279) -- all clean (results/p520_g3_1b_retest_
+        20260612/). So knob-unset bf16 Gemma 3 retires Triton -> FLASHINFER
+        on CC 12.x exactly like Gemma 4. (The separate sm_120 nvfp4-KV read
+        defect does not gate this bf16-routing flip.)"""
         fake_cc(capability)
         cfg = _mock_vllm_config(global_head_dim=None)
-        assert _gemma3_route(cfg) is None
+        assert _gemma3_route(cfg) == AttentionBackendEnum.FLASHINFER
 
-    def test_empty_string_is_not_an_opt_in(self, fake_cc, monkeypatch):
-        """Scoping-fix pin: Gemma 3 routes only on an EXPLICIT enabling
-        value (pre-flip opt-in semantics); the empty string is not one."""
+    def test_empty_string_behaves_like_unset(self, fake_cc, monkeypatch):
+        """Post-flip: Gemma 3 is now default-on, so only "0" disables; the
+        empty string routes like unset (matches the Gemma 4 cell)."""
         fake_cc(CC12_0)
         monkeypatch.setenv(KNOB, "")
         cfg = _mock_vllm_config(global_head_dim=None)
-        assert _gemma3_route(cfg) is None
+        assert _gemma3_route(cfg) == AttentionBackendEnum.FLASHINFER
 
     def test_knob_zero_leaves_backend_unset(self, fake_cc, monkeypatch):
-        """=0 keeps upstream selection (escape hatch wording retained;
-        for Gemma 3 this now matches the knob-unset default)."""
+        """=0 is the escape hatch: keeps upstream selection (backend
+        unset). Post-re-flip this now DIFFERS from the knob-unset default
+        (which routes FLASHINFER), matching the Gemma 4 cell."""
         fake_cc(CC12_0)
         monkeypatch.setenv(KNOB, "0")
         cfg = _mock_vllm_config(global_head_dim=None)
@@ -371,23 +371,17 @@ class TestGemma3Routing:
         cfg = _mock_vllm_config(cache_dtype="fp8", global_head_dim=None)
         assert _gemma3_route(cfg) is None
 
-    def test_mm_prefix_lm_default_leaves_backend_unset(self, fake_cc):
-        """RECONCILED with the 2026-06-12 Gemma-3 scoping fix (mm-merge):
-        the Amendment 4 mm default flip does NOT override the Gemma 3
-        bf16 scope-out. Because Gemma 3 is default_on=False, the
-        bf16-knob-unset early-return fires BEFORE the mm-prefix branch
-        (config.py: ``if not default_on and raw in (None, "")``), so a
-        knob-unset Gemma 3 — text OR mm-prefix — leaves the backend unset
-        for upstream priority order on sm_120/121 (FlashInfer is
-        numerically wrong at d256/SWA-512; see
-        test_default_leaves_backend_unset). The mm-retire branch's
-        original expectation (route FLASHINFER by default) predated the
-        scope-out and is superseded. Gemma 3 mm routes only on an
-        EXPLICIT bf16 opt-in (=1) with MM_PREFIX not =0 — pinned in
-        test_mm_prefix_lm_explicit_opt_in_routes_flashinfer below."""
+    def test_mm_prefix_lm_default_routes_flashinfer(self, fake_cc):
+        """Post-flip (2026-06-12 re-flip, scope-out refuted): Gemma 3 is
+        now bf16 default_on=True, so the knob-unset early-return no longer
+        fires; control reaches the mm-prefix branch, and with MM_PREFIX
+        default-on (Amendment 4) a knob-unset Gemma 3 mm-prefix-lm routes
+        FLASHINFER (the FA2 custom-mask span path). Set MM_PREFIX=0 to keep
+        the Triton mm route -- pinned in
+        test_mm_prefix_lm_mm_knob_zero_leaves_backend_unset."""
         fake_cc(CC12_0)
         cfg = _mock_vllm_config(global_head_dim=None, is_mm_prefix_lm=True)
-        assert _gemma3_route(cfg) is None
+        assert _gemma3_route(cfg) == AttentionBackendEnum.FLASHINFER
 
     @pytest.mark.parametrize("mm_knob", [None, "1"])
     def test_mm_prefix_lm_explicit_opt_in_routes_flashinfer(
