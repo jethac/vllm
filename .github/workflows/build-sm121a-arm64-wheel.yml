@@ -1,12 +1,17 @@
 # dgx-spark-hijinks campaign: CI sm_121a aarch64 vLLM wheel for Spark-class ARM hosts.
 #
-# This workflow is intentionally manual-only while the first x64/sm_120a build
-# is still being shaken out. It runs on Ubicloud arm64 so no local CPU or Spark
-# window is spent compiling.
+# This workflow runs on Ubicloud arm64 so no local CPU or Spark window is spent
+# compiling. It is intentionally separate from the x64 sm_120a workflow so both
+# builds can run in parallel.
 
 name: build-sm121a-arm64-wheel
 
 on:
+  push:
+    branches:
+      - spark/hijinks-e2-vllm
+    paths:
+      - ".github/workflows/build-sm121a-arm64-wheel.yml"
   workflow_dispatch:
     inputs:
       release_tag_suffix:
