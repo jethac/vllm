@@ -61,10 +61,10 @@ env:
 
 jobs:
   build-wheel:
-    # Largest standard GitHub-hosted runner available to this repo. If the
-    # cold build (with the free-disk + ccache design below) ever exceeds the
-    # 6 h job limit, re-run: ccache makes the second pass mostly cache hits.
-    runs-on: ubuntu-latest
+    # Ubicloud keeps this CPU-heavy nvcc build off local machines and off the
+    # Spark. The 30-vCPU shape gives enough CPU/RAM/disk for a single-arch
+    # sm_120a wheel while staying within the hosted runner integration.
+    runs-on: ubicloud-standard-30
     timeout-minutes: 355
     steps:
       - name: Checkout
@@ -128,13 +128,13 @@ jobs:
           TORCH_CUDA_ARCH_LIST: "12.0a"
           VLLM_MAIN_CUDA_VERSION: "13.0"
           VLLM_TARGET_DEVICE: cuda
-          MAX_JOBS: "4" # standard runner: 4 vCPU
+          MAX_JOBS: "20" # ubicloud-standard-30: leave memory headroom for nvcc
           NVCC_THREADS: "1"
-          CMAKE_BUILD_PARALLEL_LEVEL: "4"
+          CMAKE_BUILD_PARALLEL_LEVEL: "20"
           CMAKE_C_COMPILER_LAUNCHER: ccache
           CMAKE_CXX_COMPILER_LAUNCHER: ccache
           CMAKE_CUDA_COMPILER_LAUNCHER: ccache
-          CCACHE_MAXSIZE: 5G
+          CCACHE_MAXSIZE: 20G
         run: |
           set -euxo pipefail
           export PATH="${CUDA_HOME}/bin:${PATH}"
