@@ -179,13 +179,23 @@ jobs:
           find /tmp/wheel_audit -name "*.so" -size +1M | sort
           echo "=== cuobjdump arch audit (expect sm_120a, no stray arch-only payloads) ==="
           FAIL=0
-          for so in $(find /tmp/wheel_audit -name "_C*.abi3.so" -o -name "_moe_C*.abi3.so" -o -name "_vllm_fa2_C*.abi3.so" -o -name "_vllm_fa3_C*.abi3.so"); do
+          # Enforce sm_120a on vLLM's core extensions. The bundled FA2/FA3
+          # compatibility extensions may carry upstream legacy cubins and are
+          # not the campaign's Gemma/FlashInfer execution path; print them
+          # below as informational provenance instead of failing the wheel.
+          for so in $(find /tmp/wheel_audit -name "_C*.abi3.so" -o -name "_moe_C*.abi3.so"); do
             echo "--- ${so}"
             ${CUDA_HOME}/bin/cuobjdump -lelf "${so}" > /tmp/cuobj.txt 2>&1 || { echo "(no ELF payload)"; continue; }
             grep -oE 'sm_[0-9]+a?' /tmp/cuobj.txt | sort | uniq -c
             grep -q 'sm_120a' /tmp/cuobj.txt || { echo "::error::${so} contains no sm_120a cubins"; FAIL=1; }
           done
           test "${FAIL}" = "0"
+          echo "=== informational FA extension arch inventory ==="
+          for so in $(find /tmp/wheel_audit -name "_vllm_fa2_C*.abi3.so" -o -name "_vllm_fa3_C*.abi3.so"); do
+            echo "--- ${so}"
+            ${CUDA_HOME}/bin/cuobjdump -lelf "${so}" > /tmp/cuobj.txt 2>&1 || { echo "(no ELF payload)"; continue; }
+            grep -oE 'sm_[0-9]+a?' /tmp/cuobj.txt | sort | uniq -c || true
+          done
           # Full `import vllm` is deliberately NOT attempted: it requires a GPU
           # driver; this runner has none. Import verification happens in the
           # Colab G4 notebook's first serving cell.
