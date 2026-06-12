@@ -7,6 +7,11 @@
 # Decoupled from the wheel build: it consumes an already-published arm64 wheel
 # release (input wheel_release_tag), so adding/rerunning this never needs a
 # fresh compile.
+#
+# PARKED (2026-06-12): this is the "full from-scratch CI-reproducible image"
+# end-state (24.04 + torch 2.12, a fresh stack). The PRIMARY Spark path is now
+# r11 = the proven r10 image + the 22.04/torch-2.11 e2-dgv wheel (reuse the
+# validated stack, swap only vLLM). dispatch-only so it doesn't auto-run.
 
 name: build-spark-image
 
@@ -25,12 +30,6 @@ on:
         description: "Optional suffix for the image tag"
         required: false
         default: ""
-  push:
-    branches:
-      - spark/hijinks-e2-dgv
-    paths:
-      - ".github/workflows/build-spark-image.yml"
-      - "docker/Dockerfile.spark"
 
 permissions:
   contents: read
