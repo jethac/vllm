@@ -1,0 +1,43 @@
+# r11 = the proven r10 Spark image + the e2-dgv vLLM (swap ONLY vLLM).
+#
+# r10 (jethac-vllm-aeon-gemma4:9759e3b06-rebuiltc-76af7982-sm121a-r10) is
+# Ubuntu 22.04 / glibc 2.35 / torch 2.11 / FlashInfer 76af7982 / transformers
+# 5.11.0, validated serving the full Gemma 4 NVFP4 ladder on GB10. r11 reuses
+# ALL of it and replaces the baked vLLM (9759e3b06) with the e2-dgv wheel
+# (DiffusionGemma + unified FIPrefillGroup), which is built glibc-2.35/torch-2.11
+# so it drops in with no retrofit. Layer-add only -- no compile -- exactly how
+# r10 derived from r9, so it's fine to bake this on Spark.
+
+ARG BASE_IMAGE=jethac-vllm-aeon-gemma4:9759e3b06-rebuiltc-76af7982-sm121a-r10
+FROM ${BASE_IMAGE}
+
+ARG VLLM_WHEEL=vllm.whl
+ARG IMAGE_GENERATION=r11
+
+LABEL spark.image_generation="${IMAGE_GENERATION}" \
+      spark.base="r10" \
+      spark.vllm="e2-dgv"
+
+# Remove r10's baked editable vLLM (egg-link/.pth at /opt/jethac-vllm) so the
+# wheel's vLLM wins, then install the e2-dgv wheel WITHOUT deps (reuse r10's
+# proven torch/flashinfer/transformers/deps untouched).
+RUN python3 -m pip uninstall -y vllm || true
+COPY ${VLLM_WHEEL} /tmp/vllm.whl
+RUN python3 -m pip install --no-deps /tmp/vllm.whl && rm /tmp/vllm.whl
+
+# move WORKDIR off /opt/jethac-vllm so the stale source tree can't shadow the
+# installed wheel via cwd
+WORKDIR /workspace
+
+# VO-split knobs gate DiffusionGemma's FLASHINFER allowance + the D=512 two-pass
+ENV VLLM_FLASHINFER_VOSPLIT=1
+ENV VLLM_NVFP4_KV_VOSPLIT=1
+
+# GPU-free provenance: e2-dgv vLLM is the one resolved + DiffusionGemma + the
+# unified grouping are present (no CUDA import -- the GPU import probe runs at
+# serve time on Spark).
+RUN python3 -c "import importlib.metadata as m; v=m.version('vllm'); print('vllm', v); assert 'sm121a' in v or '98cd3' in v, v" \
+ && python3 -c "import importlib.util as u; assert u.find_spec('vllm.model_executor.models.diffusion_gemma'); print('diffusion_gemma module present')" \
+ && python3 -c "import transformers; assert transformers.__version__.startswith('5.11'); print('transformers', transformers.__version__)"
+
+CMD ["/bin/bash", "-lc", "sleep infinity"]
