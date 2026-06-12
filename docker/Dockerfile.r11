@@ -22,8 +22,8 @@ LABEL spark.image_generation="${IMAGE_GENERATION}" \
 # wheel's vLLM wins, then install the e2-dgv wheel WITHOUT deps (reuse r10's
 # proven torch/flashinfer/transformers/deps untouched).
 RUN python3 -m pip uninstall -y vllm || true
-COPY ${VLLM_WHEEL} /tmp/vllm.whl
-RUN python3 -m pip install --no-deps /tmp/vllm.whl && rm /tmp/vllm.whl
+COPY ${VLLM_WHEEL} /tmp/
+RUN python3 -m pip install --no-deps "/tmp/${VLLM_WHEEL}" && rm "/tmp/${VLLM_WHEEL}"
 
 # move WORKDIR off /opt/jethac-vllm so the stale source tree can't shadow the
 # installed wheel via cwd
