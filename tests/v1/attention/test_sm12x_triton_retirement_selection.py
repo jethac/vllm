@@ -371,11 +371,36 @@ class TestGemma3Routing:
         cfg = _mock_vllm_config(cache_dtype="fp8", global_head_dim=None)
         assert _gemma3_route(cfg) is None
 
-    def test_mm_prefix_lm_default_routes_flashinfer(self, fake_cc):
-        """NEW with the Amendment 4 mm default flip: multimodal Gemma 3
-        (mm-prefix spans on ALL layer groups) routes to FLASHINFER by
-        default on CC 12.x."""
+    def test_mm_prefix_lm_default_leaves_backend_unset(self, fake_cc):
+        """RECONCILED with the 2026-06-12 Gemma-3 scoping fix (mm-merge):
+        the Amendment 4 mm default flip does NOT override the Gemma 3
+        bf16 scope-out. Because Gemma 3 is default_on=False, the
+        bf16-knob-unset early-return fires BEFORE the mm-prefix branch
+        (config.py: ``if not default_on and raw in (None, "")``), so a
+        knob-unset Gemma 3 — text OR mm-prefix — leaves the backend unset
+        for upstream priority order on sm_120/121 (FlashInfer is
+        numerically wrong at d256/SWA-512; see
+        test_default_leaves_backend_unset). The mm-retire branch's
+        original expectation (route FLASHINFER by default) predated the
+        scope-out and is superseded. Gemma 3 mm routes only on an
+        EXPLICIT bf16 opt-in (=1) with MM_PREFIX not =0 — pinned in
+        test_mm_prefix_lm_explicit_opt_in_routes_flashinfer below."""
         fake_cc(CC12_0)
+        cfg = _mock_vllm_config(global_head_dim=None, is_mm_prefix_lm=True)
+        assert _gemma3_route(cfg) is None
+
+    @pytest.mark.parametrize("mm_knob", [None, "1"])
+    def test_mm_prefix_lm_explicit_opt_in_routes_flashinfer(
+        self, fake_cc, monkeypatch, mm_knob
+    ):
+        """Explicit Gemma 3 bf16 opt-in (=1) routes mm-prefix spans onto
+        the FlashInfer FA2 custom-mask path (experiments only — known
+        numerically wrong on sm_120 d256/SWA-512), whether MM_PREFIX is
+        unset (default-on) or explicit =1; MM_PREFIX=0 stands it down."""
+        fake_cc(CC12_0)
+        monkeypatch.setenv(KNOB, "1")
+        if mm_knob is not None:
+            monkeypatch.setenv("VLLM_FLASHINFER_MM_PREFIX", mm_knob)
         cfg = _mock_vllm_config(global_head_dim=None, is_mm_prefix_lm=True)
         assert _gemma3_route(cfg) == AttentionBackendEnum.FLASHINFER
 
