@@ -11,6 +11,7 @@ on:
   push:
     branches:
       - spark/hijinks-e2-vllm
+      - spark/hijinks-e2-dgv
     paths:
       - ".github/workflows/build-sm121a-arm64-wheel.yml"
   workflow_dispatch:
