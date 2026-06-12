@@ -29,13 +29,16 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  TORCH_VERSION: "2.12.0"
+  # torch 2.11 + 22.04 build base to MATCH the proven Spark r10 serving stack
+  # (Ubuntu 22.04 / glibc 2.35 / torch 2.11 / flashinfer 76af7982). The wheel
+  # then drops into r10 with zero retrofit; bake r11 = r10 + this wheel.
+  TORCH_VERSION: "2.11.0"
   TORCH_INDEX_URL: "https://download.pytorch.org/whl/cu130"
   CUDA_HOME: /usr/local/cuda-13.0
 
 jobs:
   build-wheel:
-    runs-on: ubicloud-standard-30-arm
+    runs-on: ubicloud-standard-30-arm-ubuntu-2204
     timeout-minutes: 355
     steps:
       - name: Checkout
@@ -154,6 +157,16 @@ jobs:
             ${CUDA_HOME}/bin/cuobjdump -lelf "${so}" > /tmp/cuobj.txt 2>&1 || { echo "(no ELF payload)"; continue; }
             grep -oE 'sm_[0-9]+a?' /tmp/cuobj.txt | sort | uniq -c
             grep -q 'sm_121a' /tmp/cuobj.txt || { echo "::error::${so} contains no sm_121a cubins"; FAIL=1; }
+            # glibc ceiling gate: must load on the Spark r10 stack (Ubuntu 22.04 / glibc 2.35)
+            MAXGLIBC="$(objdump -T "${so}" 2>/dev/null | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -V | tail -1 || true)"
+            echo "max_glibc=${MAXGLIBC:-none}"
+            if [[ -n "${MAXGLIBC}" ]]; then
+              GLIBC_CEILING="$(printf '%s\n2.35\n' "${MAXGLIBC#GLIBC_}" | sort -V | tail -1)"
+              if [[ "${GLIBC_CEILING}" != "2.35" ]]; then
+                echo "::error::${so} needs ${MAXGLIBC} > GLIBC_2.35 (won't load on Spark r10 / Ubuntu 22.04)"
+                FAIL=1
+              fi
+            fi
           done
           test "${FAIL}" = "0"
           echo "=== informational FA extension arch inventory ==="
@@ -180,7 +193,7 @@ jobs:
           WHEEL="$(ls dist/vllm-*.whl)"
           NOTES="sm_121a (CC 12.1, GB10 / DGX Spark class) arm64 vLLM wheel.
           Source: ${{ github.ref_name }} @ ${{ github.sha }}
-          Toolchain: nvcc 13.0 (Ubuntu 24.04 SBSA repo), torch ${TORCH_VERSION}+cu130, TORCH_CUDA_ARCH_LIST=12.1a, python 3.12."
+          Toolchain: nvcc 13.0 (SBSA repo, build OS auto), torch ${TORCH_VERSION}+cu130, TORCH_CUDA_ARCH_LIST=12.1a, python 3.12. Built on Ubuntu 22.04 / glibc 2.35 to match the Spark r10 serving stack (torch 2.11) -- loads in r10 with no retrofit; bake r11 = r10 + this wheel."
           if gh release view "${TAG}" >/dev/null 2>&1; then
             gh release upload "${TAG}" "${WHEEL}" --clobber
           else
