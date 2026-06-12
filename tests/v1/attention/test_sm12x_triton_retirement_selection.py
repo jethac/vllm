@@ -15,8 +15,17 @@ model-wide TRITON_ATTN force. These tests pin:
 DEFAULT FLIP (Amendment 3, OVERNIGHT_LADDER_PLAN_20260612): the knob is
 now DEFAULT-ON; VLLM_FLASHINFER_BF16_GEMMA=0 is the escape hatch. Only
 knob-unset text-only bf16 Gemma cells on CC 12.x flipped expectation;
-the mm carve-out, quantized-KV routes, explicit --attention-backend, and
-non-CC-12.x behavior are pinned unchanged below.
+the quantized-KV routes, explicit --attention-backend, and non-CC-12.x
+behavior are pinned unchanged below.
+
+MM DEFAULT FLIP (Amendment 4, same plan): VLLM_FLASHINFER_MM_PREFIX is
+now also DEFAULT-ON — mm-prefix spans route to the FlashInfer FA2
+custom-mask path by default, retiring the Triton mm fallback on
+CC 12.x. =0 is the escape hatch (mm spans keep upstream routing);
+explicit =1 keeps the pre-flip opt-in semantics (any CC, any mm-prefix
+arch, any KV dtype). The DEFAULT is scoped to Gemma 3/4 mm archs on
+CC 12.x and to probe-validated KV dtypes (bf16/"auto"/nvfp4); fp8-KV mm
+spans, non-Gemma mm archs and non-12.x CCs keep upstream behavior.
 
 SCOPING FIX (2026-06-12): the default flip is scoped to the GEMMA 4
 FAMILY ONLY. Gemma 3 knob-unset cells revert to pre-flip expectations
@@ -220,32 +229,56 @@ class TestGemma4Routing:
         assert _gemma4_route(cfg) == AttentionBackendEnum.TRITON_ATTN
 
     @pytest.mark.parametrize("knob", [None, "1"])
-    def test_mm_prefix_lm_without_mm_knob_does_not_route(
+    def test_mm_prefix_lm_default_routes_flashinfer(
         self, fake_cc, monkeypatch, knob
     ):
-        """mm carve-out, UNCHANGED by the default flip: multimodal Gemma
-        (mm-prefix spans live) cannot be forced onto FlashInfer without
-        VLLM_FLASHINFER_MM_PREFIX — backend validation would hard-fail at
-        startup. Upstream (Triton-capable) route must stand whether the
-        bf16 routing is default-on (knob unset) or explicit =1."""
+        """FLIPPED by the Amendment 4 mm default flip (was: the mm
+        carve-out kept the upstream Triton-capable route): multimodal
+        Gemma 4 with VLLM_FLASHINFER_MM_PREFIX unset now routes to
+        FLASHINFER by default — the spans run on the FA2 custom-mask
+        path. Holds whether the bf16 routing is default-on (knob unset)
+        or explicit =1."""
         fake_cc(CC12_0)
         if knob is not None:
             monkeypatch.setenv(KNOB, knob)
+        cfg = _mock_vllm_config(is_mm_prefix_lm=True)
+        assert _gemma4_route(cfg) == AttentionBackendEnum.FLASHINFER
+
+    @pytest.mark.parametrize("knob", [None, "1"])
+    def test_mm_prefix_lm_mm_knob_zero_keeps_triton(
+        self, fake_cc, monkeypatch, knob
+    ):
+        """Escape hatch of the Amendment 4 flip: MM_PREFIX=0 stands the
+        route down for mm models — FlashInfer cannot serve the spans, so
+        the upstream (Triton-capable) route must stand, whether the bf16
+        routing is default-on or explicit =1."""
+        fake_cc(CC12_0)
+        if knob is not None:
+            monkeypatch.setenv(KNOB, knob)
+        monkeypatch.setenv("VLLM_FLASHINFER_MM_PREFIX", "0")
         cfg = _mock_vllm_config(is_mm_prefix_lm=True)
         assert _gemma4_route(cfg) == AttentionBackendEnum.TRITON_ATTN
 
     @pytest.mark.parametrize("knob", [None, "1"])
     def test_mm_prefix_lm_with_mm_knob_routes(self, fake_cc, monkeypatch, knob):
-        """Per the Amendment 3 carve-out wording ("mm spans keep Triton
-        unless VLLM_FLASHINFER_MM_PREFIX is set"): with MM_PREFIX set the
-        guard stands down, so the bf16 routing applies — by default
-        (knob unset) just as with explicit =1."""
+        """Explicit MM_PREFIX=1 routes exactly as pre-flip (both-knobs
+        semantics), and now coincides with the default."""
         fake_cc(CC12_0)
         if knob is not None:
             monkeypatch.setenv(KNOB, knob)
         monkeypatch.setenv("VLLM_FLASHINFER_MM_PREFIX", "1")
         cfg = _mock_vllm_config(is_mm_prefix_lm=True)
         assert _gemma4_route(cfg) == AttentionBackendEnum.FLASHINFER
+
+    def test_mm_prefix_lm_bf16_knob_zero_keeps_triton(self, fake_cc, monkeypatch):
+        """The bf16 escape hatch reverts the WHOLE forced route for mm
+        models too (mm spans then ride the upstream Gemma4 Triton force);
+        VLLM_FLASHINFER_MM_PREFIX stays default-on but has no forced
+        route to compose with."""
+        fake_cc(CC12_0)
+        monkeypatch.setenv(KNOB, "0")
+        cfg = _mock_vllm_config(is_mm_prefix_lm=True)
+        assert _gemma4_route(cfg) == AttentionBackendEnum.TRITON_ATTN
 
     def test_existing_vosplit_knob_still_forces_flashinfer(
         self, fake_cc, monkeypatch
@@ -336,6 +369,36 @@ class TestGemma3Routing:
         if knob is not None:
             monkeypatch.setenv(KNOB, knob)
         cfg = _mock_vllm_config(cache_dtype="fp8", global_head_dim=None)
+        assert _gemma3_route(cfg) is None
+
+    def test_mm_prefix_lm_default_routes_flashinfer(self, fake_cc):
+        """NEW with the Amendment 4 mm default flip: multimodal Gemma 3
+        (mm-prefix spans on ALL layer groups) routes to FLASHINFER by
+        default on CC 12.x."""
+        fake_cc(CC12_0)
+        cfg = _mock_vllm_config(global_head_dim=None, is_mm_prefix_lm=True)
+        assert _gemma3_route(cfg) == AttentionBackendEnum.FLASHINFER
+
+    def test_mm_prefix_lm_mm_knob_zero_leaves_backend_unset(
+        self, fake_cc, monkeypatch
+    ):
+        """Escape hatch: MM_PREFIX=0 stands the route down; Gemma 3 mm
+        falls back to the upstream priority order (backend unset)."""
+        fake_cc(CC12_0)
+        monkeypatch.setenv("VLLM_FLASHINFER_MM_PREFIX", "0")
+        cfg = _mock_vllm_config(global_head_dim=None, is_mm_prefix_lm=True)
+        assert _gemma3_route(cfg) is None
+
+    def test_mm_prefix_lm_bf16_knob_zero_leaves_backend_unset(
+        self, fake_cc, monkeypatch
+    ):
+        """The bf16 escape hatch reverts the whole forced route for mm
+        Gemma 3 as well (upstream priority order decides; the mm default
+        still lets FlashInfer CLAIM mm support there — pinned in
+        TestFlashInferMMPrefixSupport)."""
+        fake_cc(CC12_0)
+        monkeypatch.setenv(KNOB, "0")
+        cfg = _mock_vllm_config(global_head_dim=None, is_mm_prefix_lm=True)
         assert _gemma3_route(cfg) is None
 
 
@@ -455,6 +518,198 @@ class TestFlashInferHead512SelectorHonesty:
 
 
 # ---------------------------------------------------------------------------
+# 2b. mm-prefix support scoping (Amendment 4 default flip)
+# ---------------------------------------------------------------------------
+
+GEMMA_MM_ARCHS = [
+    ["Gemma3ForConditionalGeneration"],
+    ["Gemma4ForConditionalGeneration"],
+    ["Gemma4UnifiedForConditionalGeneration"],
+]
+
+
+@pytest.fixture
+def fake_current_model(monkeypatch):
+    """Pin vllm.config.get_current_vllm_config_or_none to a fake config
+    holding a model with the given architectures. None = no vllm config
+    in scope (a bare validate_configuration call): the mm default must
+    then conservatively not vouch."""
+
+    def _set(architectures):
+        import vllm.config as config_mod
+
+        if architectures is None:
+            fake = lambda: None  # noqa: E731
+        else:
+            model_config = SimpleNamespace(architectures=architectures)
+            fake = lambda: SimpleNamespace(model_config=model_config)  # noqa: E731
+        monkeypatch.setattr(config_mod, "get_current_vllm_config_or_none", fake)
+
+    return _set
+
+
+class TestFlashInferMMPrefixSupport:
+    @pytest.mark.parametrize("archs", GEMMA_MM_ARCHS)
+    def test_default_claims_gemma_mm_on_cc12(
+        self, fake_fi_cc_family, fake_current_model, archs
+    ):
+        """FLIPPED by the Amendment 4 mm default flip: knob unset,
+        FlashInfer now claims mm-prefix support for Gemma 3/4 mm archs
+        on CC 12.x devices (was: claim only with the knob set)."""
+        fake_fi_cc_family(120)
+        fake_current_model(archs)
+        assert FlashInferBackend.supports_mm_prefix() is True
+
+    def test_default_does_not_claim_non_gemma_archs(
+        self, fake_fi_cc_family, fake_current_model
+    ):
+        """Arch scope: the default never vouches for mm-prefix archs
+        (bagel/molmo2/moondream3/paligemma/umm) whose masking policy was
+        not implemented/validated on this backend."""
+        fake_fi_cc_family(120)
+        fake_current_model(["Moondream3ForConditionalGeneration"])
+        assert FlashInferBackend.supports_mm_prefix() is False
+
+    def test_default_does_not_claim_off_cc12(
+        self, fake_fi_cc_family, fake_current_model
+    ):
+        """CC scope: the default never leaks off 12.x."""
+        fake_fi_cc_family(90)
+        fake_current_model(["Gemma4ForConditionalGeneration"])
+        assert FlashInferBackend.supports_mm_prefix() is False
+
+    def test_default_without_config_in_scope_does_not_claim(
+        self, fake_fi_cc_family, fake_current_model
+    ):
+        fake_fi_cc_family(120)
+        fake_current_model(None)
+        assert FlashInferBackend.supports_mm_prefix() is False
+
+    def test_explicit_one_claims_unconditionally(
+        self, monkeypatch, fake_fi_cc_family, fake_current_model
+    ):
+        """Explicit =1 keeps the pre-flip opt-in semantics: any CC, any
+        mm-prefix arch."""
+        fake_fi_cc_family(90)
+        fake_current_model(["Moondream3ForConditionalGeneration"])
+        monkeypatch.setenv("VLLM_FLASHINFER_MM_PREFIX", "1")
+        assert FlashInferBackend.supports_mm_prefix() is True
+
+    def test_zero_disables(
+        self, monkeypatch, fake_fi_cc_family, fake_current_model
+    ):
+        """Escape hatch: =0 restores the pre-knob rejection even for
+        Gemma mm archs on CC 12.x."""
+        fake_fi_cc_family(120)
+        fake_current_model(["Gemma4ForConditionalGeneration"])
+        monkeypatch.setenv("VLLM_FLASHINFER_MM_PREFIX", "0")
+        assert FlashInferBackend.supports_mm_prefix() is False
+
+
+# ---------------------------------------------------------------------------
+# 2c. mm x KV-dtype validation matrix (Amendment 4 interaction cells)
+# ---------------------------------------------------------------------------
+
+
+def _validate_mm(head_size, kv_cache_dtype, capability):
+    return FlashInferBackend.validate_configuration(
+        head_size=head_size,
+        dtype=torch.bfloat16,
+        kv_cache_dtype=kv_cache_dtype,
+        block_size=16,
+        use_mla=False,
+        has_sink=False,
+        use_sparse=False,
+        use_mm_prefix=True,
+        use_per_head_quant_scales=False,
+        device_capability=capability,
+        attn_type="decoder",
+    )
+
+
+class TestFlashInferMMKvDtypeMatrix:
+    """validate_configuration cells with use_mm_prefix=True, pinning the
+    mm flip x bf16 flip x quantized-KV interaction matrix. Default-mode
+    cells mock a CC 12.x device family and a Gemma mm model in scope."""
+
+    @pytest.fixture(autouse=True)
+    def _gemma_on_cc12(self, fake_fi_cc_family, fake_current_model):
+        self._set_model = fake_current_model
+        fake_fi_cc_family(120)
+        fake_current_model(["Gemma4ForConditionalGeneration"])
+
+    @pytest.mark.parametrize("kv", ["auto", "bfloat16"])
+    def test_mm_bf16_kv_accepted_by_default(self, kv):
+        """FLIPPED by the Amendment 4 mm default flip (was: mm rejected
+        without the knob)."""
+        assert _validate_mm(256, kv, CC12_0) == []
+
+    def test_mm_nvfp4_kv_accepted_by_default(self):
+        """THE Amendment 4 interaction cell: mm spans with NVFP4 KV are
+        probe-proven (nvfp4_d256 mask probe) and must route FlashInfer
+        (head-256 sliding layers of Gemma 4, all layers of Gemma 3)."""
+        assert _validate_mm(256, "nvfp4", CC12_0) == []
+
+    def test_mm_nvfp4_head512_accepted_with_nvfp4_knobs(self, monkeypatch):
+        """mm x NVFP4 x VO-split composition: Gemma 4 D512 global layers
+        under full-NVFP4 KV still need the NVFP4 VO-split knob pair
+        (unchanged); with it the mm default composes. (The 'vision'
+        policy keeps these layers causal at build time, but selection is
+        model-wide mm.)"""
+        monkeypatch.setenv("VLLM_NVFP4_KV_VOSPLIT", "1")
+        monkeypatch.setenv("VLLM_NVFP4_KV_LINEAR_V_SF", "1")
+        assert _validate_mm(512, "nvfp4", CC12_0) == []
+
+    def test_mm_bf16_head512_accepted_by_default(self):
+        """mm flip x bf16 flip composition: both defaults vouch — bf16
+        default for the head-512 VO split, mm default for the spans."""
+        assert _validate_mm(512, "auto", CC12_0) == []
+
+    def test_mm_fp8_kv_rejected_by_default(self):
+        """KV-dtype scope of the mm default: fp8-KV mm spans were never
+        probe-validated; the default must not vouch (upstream/Triton
+        keeps the cell). Explicit =1 opts in."""
+        reasons = _validate_mm(256, "fp8", CC12_0)
+        assert any("MM_PREFIX" in r for r in reasons), reasons
+
+    def test_mm_fp8_kv_accepted_with_explicit_knob(self, monkeypatch):
+        """Explicit =1 keeps the pre-flip opt-in scope (any KV dtype)."""
+        monkeypatch.setenv("VLLM_FLASHINFER_MM_PREFIX", "1")
+        assert _validate_mm(256, "fp8", CC12_0) == []
+
+    def test_mm_knob_zero_rejected(self, monkeypatch):
+        """Escape hatch: =0 restores the pre-knob mm rejection."""
+        monkeypatch.setenv("VLLM_FLASHINFER_MM_PREFIX", "0")
+        reasons = _validate_mm(256, "auto", CC12_0)
+        assert any("multimodal" in r for r in reasons), reasons
+
+    def test_mm_non_gemma_arch_rejected_by_default(self):
+        """Arch scope at the validation level."""
+        self._set_model(["Moondream3ForConditionalGeneration"])
+        reasons = _validate_mm(256, "auto", CC12_0)
+        assert any("multimodal" in r for r in reasons), reasons
+
+    def test_mm_fp8_triton_fallback_cell_is_reachable(self):
+        """Where the mm default declines fp8 KV, the upstream fallback
+        must have a valid landing spot: Triton accepts mm + fp8 KV."""
+        triton_cls = AttentionBackendEnum.TRITON_ATTN.get_class()
+        reasons = triton_cls.validate_configuration(
+            head_size=256,
+            dtype=torch.bfloat16,
+            kv_cache_dtype="fp8",
+            block_size=16,
+            use_mla=False,
+            has_sink=False,
+            use_sparse=False,
+            use_mm_prefix=True,
+            use_per_head_quant_scales=False,
+            device_capability=CC12_0,
+            attn_type="decoder",
+        )
+        assert reasons == []
+
+
+# ---------------------------------------------------------------------------
 # 3. _vo_split_factor knob semantics
 # ---------------------------------------------------------------------------
 
@@ -557,3 +812,22 @@ class TestEnvKnob:
 
         monkeypatch.setenv(KNOB, "0")
         assert envs.VLLM_FLASHINFER_BF16_GEMMA is False
+
+    def test_mm_prefix_default_on(self):
+        """FLIPPED by the Amendment 4 mm default flip: the mm knob
+        registers as default-on (was: default-off / opt-in)."""
+        import vllm.envs as envs
+
+        assert envs.VLLM_FLASHINFER_MM_PREFIX is True
+
+    def test_mm_prefix_set_on(self, monkeypatch):
+        import vllm.envs as envs
+
+        monkeypatch.setenv("VLLM_FLASHINFER_MM_PREFIX", "1")
+        assert envs.VLLM_FLASHINFER_MM_PREFIX is True
+
+    def test_mm_prefix_zero_is_off(self, monkeypatch):
+        import vllm.envs as envs
+
+        monkeypatch.setenv("VLLM_FLASHINFER_MM_PREFIX", "0")
+        assert envs.VLLM_FLASHINFER_MM_PREFIX is False
