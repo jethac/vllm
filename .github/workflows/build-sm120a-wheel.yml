@@ -190,6 +190,21 @@ jobs:
             ${CUDA_HOME}/bin/cuobjdump -lelf "${so}" > /tmp/cuobj.txt 2>&1 || { echo "(no ELF payload)"; continue; }
             grep -oE 'sm_[0-9]+a?' /tmp/cuobj.txt | sort | uniq -c
             grep -q 'sm_120a' /tmp/cuobj.txt || { echo "::error::${so} contains no sm_120a cubins"; FAIL=1; }
+            MAXGLIBC="$(
+              objdump -T "${so}" 2>/dev/null \
+                | grep -oE 'GLIBC_[0-9]+\.[0-9]+' \
+                | sort -V \
+                | tail -1 \
+                || true
+            )"
+            echo "max_glibc=${MAXGLIBC:-none}"
+            if [[ -n "${MAXGLIBC}" ]]; then
+              GLIBC_CEILING="$(printf '%s\n2.35\n' "${MAXGLIBC#GLIBC_}" | sort -V | tail -1)"
+              if [[ "${GLIBC_CEILING}" != "2.35" ]]; then
+                echo "::error::${so} needs ${MAXGLIBC} > GLIBC_2.35 (won't load on Colab G4 / Ubuntu 22.04)"
+                FAIL=1
+              fi
+            fi
           done
           test "${FAIL}" = "0"
           echo "=== informational FA extension arch inventory ==="
