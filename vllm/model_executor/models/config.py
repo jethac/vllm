@@ -181,14 +181,19 @@ class Gemma3Config(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
         """Gemma 3 (uniform head_dim 256) needs no head-size handling;
-        the only route is the campaign CC 12.x bf16 FlashInfer knob —
-        EXPLICIT opt-in only (default_on=False): the default flip was
-        scoped back to Gemma 4 on 2026-06-12 because FlashInfer is
-        numerically wrong on sm_120 at this geometry (d256, SWA 512;
-        see _spark_route_gemma_bf16_to_flashinfer). Knob-unset Gemma 3
-        keeps upstream routing (FLASH_ATTN where supported)."""
+        the only route is the campaign CC 12.x bf16 FlashInfer knob.
+        DEFAULT-ON (default_on=True) as of 2026-06-12: the earlier
+        sm_120 "FlashInfer numerically wrong at d256/SWA-512" concern
+        was REFUTED as a WSL2/WDDM false-green artifact. The P520 1B
+        rigorous re-test (backend verified engaged, util 0.6) gave
+        FI-bf16 2.35719 vs FLASH_ATTN 2.35785 = -0.0007 nats, clean,
+        no engine wedge; reconciled with 270M (+0.00133) and Spark
+        sm_121 (+0.00279) -- all clean. So bf16 Gemma 3 retires Triton
+        on CC 12.x exactly like Gemma 4. (The sm_120 nvfp4-KV read
+        defect is a SEPARATE nvfp4 issue, not bf16 routing, and does
+        not gate this flip.)"""
         _spark_route_gemma_bf16_to_flashinfer(
-            vllm_config, "Gemma3", default_on=False
+            vllm_config, "Gemma3", default_on=True
         )
 
 
