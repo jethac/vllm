@@ -12,32 +12,25 @@ model-wide TRITON_ATTN force. These tests pin:
    on CC 12.x (the banked selector-vs-kernel head-512 discrepancy), and
 3. _vo_split_factor knob semantics.
 
-DEFAULT FLIP (Amendment 3, OVERNIGHT_LADDER_PLAN_20260612): the knob is
-now DEFAULT-ON; VLLM_FLASHINFER_BF16_GEMMA=0 is the escape hatch. Only
-knob-unset text-only bf16 Gemma cells on CC 12.x flipped expectation;
-the quantized-KV routes, explicit --attention-backend, and non-CC-12.x
-behavior are pinned unchanged below.
+bf16 retirement is OPT-IN (2026-06-13, YAK-benchmark-driven). The
+Amendment-3/4 default-on flips were REVERTED: the YAK Colab benchmark
+measured Triton bf16 vs FlashInfer bf16 across all 10 Gemma 3+4 sizes and
+found PARITY, not a speedup (Gemma 3 FA even carries slightly LESS KV
+capacity). So changing the bf16 DEFAULT buys nothing and risks unmeasured
+configs -- bf16 Gemma keeps the upstream backend (Triton for the 512-head
+Gemma 4 geometry, FLASH_ATTN for Gemma 3) unless an explicit
+VLLM_FLASHINFER_BF16_GEMMA=1. =0 is a master escape hatch (also stands down
+the mm route). The earlier "FlashInfer wrong on sm_120 at d256/SWA-512"
+claim was a refuted WSL2/WDDM artifact and is no longer load-bearing.
 
-MM DEFAULT FLIP (Amendment 4, same plan): VLLM_FLASHINFER_MM_PREFIX is
-now also DEFAULT-ON — mm-prefix spans route to the FlashInfer FA2
-custom-mask path by default, retiring the Triton mm fallback on
-CC 12.x. =0 is the escape hatch (mm spans keep upstream routing);
-explicit =1 keeps the pre-flip opt-in semantics (any CC, any mm-prefix
-arch, any KV dtype). The DEFAULT is scoped to Gemma 3/4 mm archs on
-CC 12.x and to probe-validated KV dtypes (bf16/"auto"/nvfp4); fp8-KV mm
-spans, non-Gemma mm archs and non-12.x CCs keep upstream behavior.
-
-RE-FLIP (2026-06-12, later same day): Gemma 3 bf16 default-on is
-RESTORED. The earlier scope-out rested on a sm_120 "FlashInfer wrong at
-d256/SWA-512" finding that was REFUTED as a WSL2/WDDM false-green
-artifact: the rigorous P520 1B re-test (backend verified engaged, util
-0.6) gave FI-bf16 -0.0007 nats vs FLASH_ATTN, clean, no wedge,
-reconciled with 270M (+0.00133) and Spark sm_121 (+0.00279)
-(results/p520_g3_1b_retest_20260612/). So knob-unset bf16 Gemma 3
-retires Triton -> FLASHINFER on CC 12.x exactly like Gemma 4; only "0"
-disables. The separate sm_120 nvfp4-KV read defect is an nvfp4 issue,
-not bf16 routing, and does not gate this. Backend-side cells (selector
-honesty, _vo_split_factor) are head>256 — Gemma 4 geometry — unchanged.
+mm-prefix spans stay a DEFAULT-ON CAPABILITY route, DECOUPLED from the bf16
+default: a multimodal Gemma model serves its bidirectional image spans on
+the FlashInfer FA2 custom-mask path by default (VLLM_FLASHINFER_MM_PREFIX,
+=0 to keep upstream) even when bf16 text routing is off -- because the
+upstream backends can't serve those spans. nvfp4 KV (the actual feature)
+routes via --kv-cache-dtype + VOSPLIT, independent of this function.
+Backend-side cells (selector honesty, _vo_split_factor) are head>256 --
+Gemma 4 geometry -- unchanged.
 
 Everything runs under a mocked platform/capability; no CUDA required.
 """
@@ -148,13 +141,14 @@ def _gemma4_route(vllm_config):
 
 
 class TestGemma4Routing:
-    def test_default_cc12_bf16_forces_flashinfer(self, fake_cc):
-        """FLIPPED by the Amendment 3 default flip: knob unset, text-only
-        bf16 Gemma 4 on CC 12.x now routes to FLASHINFER by default
-        (was: upstream no-FA4 branch -> model-wide TRITON_ATTN force)."""
+    def test_default_keeps_triton(self, fake_cc):
+        """OPT-IN (YAK-benchmark revert): bf16 Triton == FlashInfer on
+        throughput, so the bf16 DEFAULT is unchanged -- knob-unset text-only
+        bf16 Gemma 4 keeps the upstream no-FA4 -> model-wide TRITON_ATTN
+        force. =1 opts in to FlashInfer; nvfp4 routes via its own knobs."""
         fake_cc(CC12_0)
         cfg = _mock_vllm_config()
-        assert _gemma4_route(cfg) == AttentionBackendEnum.FLASHINFER
+        assert _gemma4_route(cfg) == AttentionBackendEnum.TRITON_ATTN
 
     def test_knob_zero_cc12_bf16_restores_triton_force(self, fake_cc, monkeypatch):
         """Escape hatch: =0 restores the pre-flip upstream behavior on
@@ -165,13 +159,12 @@ class TestGemma4Routing:
         assert _gemma4_route(cfg) == AttentionBackendEnum.TRITON_ATTN
 
     def test_empty_string_behaves_like_unset(self, fake_cc, monkeypatch):
-        """Post-flip knob parsing for the default-on family: only "0"
-        disables, so the empty string routes like unset (contrast the
-        Gemma 3 cell, where "" is not an explicit opt-in)."""
+        """Opt-in parsing: the empty string is not an opt-in (like unset),
+        so bf16 Gemma 4 keeps the upstream Triton force."""
         fake_cc(CC12_0)
         monkeypatch.setenv(KNOB, "")
         cfg = _mock_vllm_config()
-        assert _gemma4_route(cfg) == AttentionBackendEnum.FLASHINFER
+        assert _gemma4_route(cfg) == AttentionBackendEnum.TRITON_ATTN
 
     @pytest.mark.parametrize("capability", [CC12_0, CC12_1])
     def test_knob_on_cc12_bf16_forces_flashinfer(
@@ -311,28 +304,23 @@ class TestGemma4Routing:
 
 class TestGemma3Routing:
     @pytest.mark.parametrize("capability", [CC12_0, CC12_1])
-    def test_default_routes_flashinfer(self, fake_cc, capability):
-        """RE-FLIPPED default-on (2026-06-12): the prior scoping-out of
-        Gemma 3 rested on a sm_120 "FlashInfer numerically wrong at
-        d256/SWA-512" finding that was REFUTED as a WSL2/WDDM false-green
-        artifact. The rigorous P520 1B re-test (backend verified engaged,
-        util 0.6) gave FI-bf16 2.35719 vs FLASH_ATTN 2.35785 = -0.0007
-        nats, clean, no engine wedge; reconciled with 270M (+0.00133) and
-        Spark sm_121 (+0.00279) -- all clean (results/p520_g3_1b_retest_
-        20260612/). So knob-unset bf16 Gemma 3 retires Triton -> FLASHINFER
-        on CC 12.x exactly like Gemma 4. (The separate sm_120 nvfp4-KV read
-        defect does not gate this bf16-routing flip.)"""
+    def test_default_leaves_backend_unset(self, fake_cc, capability):
+        """OPT-IN (YAK-benchmark): bf16 Triton == FlashInfer (FA even slightly
+        less KV capacity for Gemma 3), so the bf16 DEFAULT is unchanged.
+        Knob-unset text-only Gemma 3 leaves the backend unset for upstream
+        priority order (FLASH_ATTN where supported); only an explicit =1
+        routes. (nvfp4 routes via its own knobs.)"""
         fake_cc(capability)
         cfg = _mock_vllm_config(global_head_dim=None)
-        assert _gemma3_route(cfg) == AttentionBackendEnum.FLASHINFER
+        assert _gemma3_route(cfg) is None
 
-    def test_empty_string_behaves_like_unset(self, fake_cc, monkeypatch):
-        """Post-flip: Gemma 3 is now default-on, so only "0" disables; the
-        empty string routes like unset (matches the Gemma 4 cell)."""
+    def test_empty_string_is_not_an_opt_in(self, fake_cc, monkeypatch):
+        """Opt-in parsing: the empty string is not an opt-in, so Gemma 3
+        bf16 stays on the upstream default."""
         fake_cc(CC12_0)
         monkeypatch.setenv(KNOB, "")
         cfg = _mock_vllm_config(global_head_dim=None)
-        assert _gemma3_route(cfg) == AttentionBackendEnum.FLASHINFER
+        assert _gemma3_route(cfg) is None
 
     def test_knob_zero_leaves_backend_unset(self, fake_cc, monkeypatch):
         """=0 is the escape hatch: keeps upstream selection (backend

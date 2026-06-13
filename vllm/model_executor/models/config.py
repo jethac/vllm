@@ -57,55 +57,35 @@ class Gemma3TextModelConfig(VerifyAndUpdateConfig):
 def _spark_route_gemma_bf16_to_flashinfer(
     vllm_config: "VllmConfig", family: str, default_on: bool
 ) -> bool:
-    """spark-hijinks: VLLM_FLASHINFER_BF16_GEMMA routes Gemma-family bf16-KV
-    configs on consumer Blackwell (CC 12.x) to FlashInfer, retiring the
-    Triton fallback there (cf. vllm-project/vllm#38887, #40677).
+    """spark-hijinks: route a Gemma-family bf16-KV config on consumer
+    Blackwell (CC 12.x) to FlashInfer. TWO INDEPENDENT reasons to route:
 
-    Scope (all must hold, otherwise no-op):
-    - the route is enabled for the family:
-      * Gemma 4 (``default_on=True``): DEFAULT-ON since the Amendment 3
-        flip (OVERNIGHT_LADDER_PLAN 2026-06-12);
-        VLLM_FLASHINFER_BF16_GEMMA=0 is the escape hatch.
-      * Gemma 3 (``default_on=False``): explicit =1 ONLY. The 2026-06-12
-        flip briefly included Gemma 3, but on sm_120 at Gemma 3 1B
-        geometry (head_dim 256, SWA window 512) FlashInfer is
-        numerically wrong for every KV dtype — FI-bf16 is +0.221 to
-        +1.380 nats off an HF-reference/FLASH_ATTN pair that agree to
-        <0.001; FI-nvfp4 emits deterministic gibberish on a virgin JIT
-        cache (results/p520_gemma3_1b_serving_20260612/). sm_121 is
-        corroborated fine, but the default must not regress sm_120, so
-        Gemma 3 keeps upstream routing (FLASH_ATTN where supported)
-        unless explicitly opted in for experiments. Re-flip is gated on
-        the FlashInfer d256/SWA root cause plus a green truth-referenced
-        rerun.
-    - the user has not chosen a backend explicitly,
-    - the device is CC 12.x (sm_120/121: DGX Spark GB10, RTX 50xx),
-    - the KV cache dtype is bf16 ("auto"/"bfloat16" — quantized-KV
-      configs keep their own routes/knobs),
-    - multimodal prefix spans are servable: since the Amendment 4 flip
-      mm-prefix Gemma routes too BY DEFAULT (spans run on the FlashInfer
-      FA2 custom-mask path); VLLM_FLASHINFER_MM_PREFIX=0 stands the
-      route down for mm models (spans keep the upstream Triton-capable
-      backend).
+    1. bf16 TEXT retirement (VLLM_FLASHINFER_BF16_GEMMA) -- OPT-IN
+       (``default_on=False`` for BOTH families). The YAK benchmark measured
+       Triton bf16 vs FlashInfer bf16 across all 10 Gemma 3+4 sizes and
+       found PARITY, not a speedup -- so the bf16 DEFAULT is unchanged
+       (upstream backend: Triton for the 512-head Gemma 4 geometry, FA for
+       Gemma 3). =1 opts in (consolidation, no perf gain); =0 is a no-op.
+       nvfp4 KV -- the actual feature -- routes via its own
+       --kv-cache-dtype + VOSPLIT knobs, NOT this function.
+    2. mm-prefix spans (VLLM_FLASHINFER_MM_PREFIX, default-on) -- a
+       multimodal CAPABILITY route, independent of (1): mm Gemma serves
+       bidirectional image-token spans on the FlashInfer FA2 custom-mask
+       path (upstream backends can't); =0 keeps the upstream route.
 
-    Uniform-256 models (Gemma 3) run plain FlashInfer FA2; heterogeneous
-    256/512 models (Gemma 4) run global D=512 layers through the exact
-    FA2 two-pass VO split, which this knob enables on the backend side
-    (see _vllm_flashinfer_bf16_gemma_requested in
-    vllm/v1/attention/backends/flashinfer.py).
-
+    Preconditions for either: no explicit backend, CC 12.x (sm_120/121),
+    bf16 ("auto"/"bfloat16") KV. Heterogeneous 256/512 Gemma 4 runs global
+    D=512 layers through the FA2 two-pass VO split, enabled backend-side.
     Returns True iff the backend was forced to FLASHINFER.
+
+    (History: an Amendment-3/4 flip briefly made bf16 + mm-prefix default-on;
+    the YAK benchmark showed the bf16 retirement is a wash, so it reverted to
+    opt-in. The earlier "FlashInfer wrong on sm_120 at d256/SWA-512" claim was
+    a refuted WSL2/WDDM artifact and is no longer load-bearing.)
     """
     import os
 
-    raw = os.environ.get("VLLM_FLASHINFER_BF16_GEMMA")
-    if raw == "0":
-        # Escape hatch: =0 restores the pre-flip (upstream) routing.
-        return False
-    if not default_on and raw in (None, ""):
-        # Gemma 3: the default never engages (sm_120 numerical
-        # regression, see docstring); only an explicit opt-in routes.
-        return False
+    # Shared preconditions for EITHER route: no explicit backend, CC 12.x, bf16 KV.
     if vllm_config.attention_config.backend is not None:
         return False
     from vllm.platforms import current_platform
@@ -121,79 +101,72 @@ def _spark_route_gemma_bf16_to_flashinfer(
         "bfloat16",
     ):
         return False
+
+    # Reason 1: bf16 TEXT retirement -- OPT-IN (default_on=False for both
+    # families). The YAK benchmark (results/colab_gemma_retirement_bench_*)
+    # measured Triton bf16 vs FlashInfer bf16 across all 10 Gemma 3+4 sizes
+    # and found PARITY, not a speedup (Gemma 3 FA even carries slightly LESS
+    # KV capacity). So changing the bf16 DEFAULT buys nothing and risks
+    # unmeasured configs -- bf16 stays on the upstream backend unless an
+    # explicit =1. (nvfp4 KV is the real feature; it routes via its own
+    # --kv-cache-dtype + VOSPLIT knobs, independent of this function.)
+    raw = os.environ.get("VLLM_FLASHINFER_BF16_GEMMA")
+    if raw == "0":
+        # Master escape hatch: =0 forces full upstream fallback (disables the
+        # bf16 AND the mm-prefix route).
+        return False
     model_config = vllm_config.model_config
-    if model_config is not None and getattr(model_config, "is_mm_prefix_lm", False):
-        if os.environ.get("VLLM_FLASHINFER_MM_PREFIX", "1") == "0":
-            # Escape hatch (inverts the pre-Amendment-4 mm guard): with
-            # the mm knob explicitly disabled, FlashInfer cannot serve
-            # the bidirectional image-token spans, so forcing FLASHINFER
-            # here would make backend validation fail at startup. Leave
-            # the upstream (Triton-capable) route alone and log the
-            # decision — no hard-fail either way.
-            logger.info(
-                "Gemma bf16 FlashInfer routing is enabled "
-                "(VLLM_FLASHINFER_BF16_GEMMA) but %s serves multimodal "
-                "prefix spans and VLLM_FLASHINFER_MM_PREFIX=0 is set: "
-                "not routing; mm spans keep the upstream "
-                "(Triton-capable) backend. Unset VLLM_FLASHINFER_MM_PREFIX "
-                "to retire the Triton mm fallback.",
-                family,
-            )
-            return False
-        # Amendment 4 (OVERNIGHT_LADDER_PLAN 2026-06-12): mm-prefix spans
-        # route to the FlashInfer FA2 custom-mask path BY DEFAULT on
-        # CC 12.x (this route is already CC-scoped above). Gemma 3 masks
-        # every layer group; Gemma 4 ('vision' policy) masks sliding
-        # groups only. Serving-proof line for the smoke gates:
-        logger.info(
-            "%s multimodal prefix spans will run on the FlashInfer FA2 "
-            "custom-mask path (VLLM_FLASHINFER_MM_PREFIX, default-on; "
-            "set =0 to keep the Triton mm route).",
-            family,
-        )
+    is_mm = model_config is not None and getattr(
+        model_config, "is_mm_prefix_lm", False
+    )
+    if is_mm and os.environ.get("VLLM_FLASHINFER_MM_PREFIX", "1") == "0":
+        # mm model with the mm-prefix path disabled: FlashInfer cannot serve
+        # the bidirectional image-token spans, so forcing it would fail backend
+        # validation at startup -- keep the upstream (Triton-capable) backend.
+        return False
+
+    # Reason 1: bf16 TEXT retirement -- opt-in (default_on=False); any
+    # non-empty value (typically "1") opts in.
+    bf16_route = True if default_on else raw not in (None, "")
+    # Reason 2: mm-prefix spans -- INDEPENDENT capability route (mm path not
+    # disabled above), default-on. Decoupled from the bf16 default so an mm
+    # model still routes its spans even when bf16 text routing is off.
+    mm_route = is_mm
+
+    if not (bf16_route or mm_route):
+        return False
+
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
     vllm_config.attention_config.backend = AttentionBackendEnum.FLASHINFER
+    reason = (
+        "bf16 opt-in (VLLM_FLASHINFER_BF16_GEMMA)"
+        if bf16_route
+        else "mm-prefix spans (VLLM_FLASHINFER_MM_PREFIX)"
+    )
     logger.info(
-        "%s with bf16 KV cache on CC %s and VLLM_FLASHINFER_BF16_GEMMA "
-        "enabled (%s): forcing FLASHINFER "
-        "(head sizes > 256 use the FA2 two-pass VO split); retiring the "
-        "TRITON_ATTN fallback.",
+        "%s on CC %s: forcing FLASHINFER via %s (head sizes > 256 use the FA2 "
+        "two-pass VO split). bf16 throughput is at PARITY with Triton (YAK "
+        "bench) -- this is opt-in/capability routing, not a default speedup.",
         family,
         capability.as_version_str(),
-        "default-on; set =0 to disable"
-        if default_on
-        else "explicit opt-in",
+        reason,
     )
-    if not default_on:
-        logger.warning(
-            "Explicit VLLM_FLASHINFER_BF16_GEMMA opt-in for %s: FlashInfer "
-            "is KNOWN NUMERICALLY WRONG on sm_120 at Gemma 3 1B geometry "
-            "(head_dim 256, SWA window 512) for every KV dtype "
-            "(results/p520_gemma3_1b_serving_20260612/); this opt-in is for "
-            "experiments only, pending the FlashInfer root-cause fix.",
-            family,
-        )
     return True
 
 
 class Gemma3Config(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
-        """Gemma 3 (uniform head_dim 256) needs no head-size handling;
-        the only route is the campaign CC 12.x bf16 FlashInfer knob.
-        DEFAULT-ON (default_on=True) as of 2026-06-12: the earlier
-        sm_120 "FlashInfer numerically wrong at d256/SWA-512" concern
-        was REFUTED as a WSL2/WDDM false-green artifact. The P520 1B
-        rigorous re-test (backend verified engaged, util 0.6) gave
-        FI-bf16 2.35719 vs FLASH_ATTN 2.35785 = -0.0007 nats, clean,
-        no engine wedge; reconciled with 270M (+0.00133) and Spark
-        sm_121 (+0.00279) -- all clean. So bf16 Gemma 3 retires Triton
-        on CC 12.x exactly like Gemma 4. (The sm_120 nvfp4-KV read
-        defect is a SEPARATE nvfp4 issue, not bf16 routing, and does
-        not gate this flip.)"""
+        """Gemma 3 (uniform head_dim 256) needs no head-size handling.
+        bf16 FlashInfer routing is OPT-IN (default_on=False): the YAK
+        benchmark showed Triton bf16 == FlashInfer bf16 on throughput
+        (FA even slightly less KV capacity for Gemma 3), so the bf16
+        default is unchanged -- only an explicit VLLM_FLASHINFER_BF16_GEMMA=1
+        routes. mm-prefix spans still route via their own knob; nvfp4 KV
+        routes via --kv-cache-dtype + VOSPLIT (the actual feature)."""
         _spark_route_gemma_bf16_to_flashinfer(
-            vllm_config, "Gemma3", default_on=True
+            vllm_config, "Gemma3", default_on=False
         )
 
 
@@ -215,14 +188,16 @@ class Gemma4Config(VerifyAndUpdateConfig):
         head_dim = getattr(hf_text_config, "head_dim", None)
         global_head_dim = getattr(hf_text_config, "global_head_dim", None)
 
-        # spark-hijinks: CC 12.x bf16 FlashInfer route (Triton retirement).
-        # Checked before the uniform-head early return so that
-        # uniform-head Gemma 4 variants route too; for heterogeneous
-        # heads it supersedes every force below (the backend is no
-        # longer None). Global D=512 layers run the FA2 two-pass VO
-        # split, which VLLM_FLASHINFER_BF16_GEMMA enables backend-side.
+        # spark-hijinks: CC 12.x Gemma routing. bf16 is OPT-IN
+        # (default_on=False) -- the YAK benchmark found Triton bf16 ==
+        # FlashInfer bf16 (parity, no speedup) across all Gemma 4 sizes, so
+        # the bf16 default stays on Triton (which handles the 512 heads via
+        # its generic path). This still fires for mm-prefix spans (own knob)
+        # and for an explicit VLLM_FLASHINFER_BF16_GEMMA=1; when it routes,
+        # global D=512 layers run the FA2 two-pass VO split backend-side.
+        # nvfp4 KV (the feature) routes separately via --kv-cache-dtype.
         if _spark_route_gemma_bf16_to_flashinfer(
-            vllm_config, "Gemma4", default_on=True
+            vllm_config, "Gemma4", default_on=False
         ):
             return
 
