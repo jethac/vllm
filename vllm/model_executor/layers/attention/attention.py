@@ -119,6 +119,31 @@ def set_default_quant_scales(layer: nn.Module, register_buffer: bool = False) ->
     layer.k_range = torch.tensor(envs.K_SCALE_CONSTANT, dtype=torch.float32)
     layer.v_range = torch.tensor(envs.V_SCALE_CONSTANT, dtype=torch.float32)
 
+    # NVFP4 KV calibrated global-scale override (productionized calibration policy).
+    # Replaces the uncalibrated 1.0 placeholder with a per-model calibrated scale when one is
+    # configured via VLLM_NVFP4_KV_CALIB; no-op otherwise (additive, opt-in).
+    try:
+        import os as _os
+        from vllm.nvfp4_kv_calib import calibrated_kv_scales
+        from vllm.config import get_current_vllm_config as _gcvc
+        _vc = _gcvc()
+        _cc = getattr(_vc, 'cache_config', None)
+        # Gate to the FA2 nvfp4 path this scale was calibrated on (consumer/SoC Blackwell,
+        # VLLM_NVFP4_KV_VOSPLIT). The trtllm/datacenter path applies k_scale differently (folds it
+        # into bmm1_scale), so a FA2-calibrated value must NOT leak there.
+        _fa2_nvfp4 = bool(_os.environ.get('VLLM_NVFP4_KV_VOSPLIT'))
+        if _cc is not None and getattr(_cc, 'cache_dtype', None) == 'nvfp4' and _fa2_nvfp4:
+            # Match by architecture signature (variant-invariant), NOT the HF model name —
+            # fine-tunes/merges/re-uploads of the same arch share the calibration.
+            _mc = getattr(_vc, 'model_config', None)
+            _hf = getattr(_mc, 'hf_config', None) if _mc is not None else None
+            _cal = calibrated_kv_scales(_hf)
+            if _cal is not None:
+                layer._k_scale.fill_(_cal[0]); layer._v_scale.fill_(_cal[1])
+                layer._k_scale_float = float(_cal[0]); layer._v_scale_float = float(_cal[1])
+    except Exception:
+        pass
+
 
 def _init_kv_cache_quant(
     layer: nn.Module,
