@@ -13,7 +13,22 @@ would silently miss every variant — a bad design.)
 Calibration source (env `VLLM_NVFP4_KV_CALIB`):
   - a directory -> looks up "<arch_signature>.json" inside it, or
   - a single JSON file -> applied iff its "arch_signature" matches (or it omits one, = wildcard).
-JSON shape: {"arch_signature": "...", "k_scale": 0.1, "v_scale": 0.1, ...}.
+JSON shape:
+  {"arch_signature": "...", "k_scale": 0.1, "v_scale": 0.1, ...}
+
+Optional, more specific overrides:
+  {
+    "layer_type_scales": {
+      "sliding_attention": {"k_scale": 0.1, "v_scale": 0.06},
+      "full_attention": {"k_scale": 0.05, "v_scale": 0.05}
+    },
+    "layer_scales": {
+      "0": {"k_scale": 0.1, "v_scale": 0.06}
+    }
+  }
+
+Resolution order is layer index, then layer type, then global scale. The global-only
+format remains valid for existing 12B/31B calibration data.
 Produced offline by docs/vast_anchor/nvfp4_kv_calibrate_nll.py.
 
 No-op (returns None) when the env is unset or nothing matches — additive, opt-in.
@@ -61,8 +76,37 @@ def arch_signature(hf_config: Any) -> Optional[str]:
     return "-".join(parts)
 
 
-def calibrated_kv_scales(hf_config: Any) -> Optional[Tuple[float, float]]:
-    """Return (k_scale, v_scale) for this architecture, or None if nothing is configured/matches."""
+def _scale_pair(d: Any) -> Optional[Tuple[float, float]]:
+    if not isinstance(d, dict):
+        return None
+    k, v = d.get("k_scale"), d.get("v_scale")
+    if k is None or v is None:
+        return None
+    try:
+        return float(k), float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _layer_type(hf_config: Any, layer_idx: Optional[int]) -> Optional[str]:
+    if layer_idx is None:
+        return None
+    layer_types = _cfg_get(hf_config, "layer_types")
+    if not layer_types or layer_idx < 0 or layer_idx >= len(layer_types):
+        return None
+    return str(layer_types[layer_idx])
+
+
+def calibrated_kv_scales(
+    hf_config: Any,
+    layer_idx: Optional[int] = None,
+    layer_type: Optional[str] = None,
+) -> Optional[Tuple[float, float]]:
+    """Return (k_scale, v_scale) for this architecture/layer, or None.
+
+    Layer-index and layer-type arguments are optional so old callers retain the
+    original global-scale behavior.
+    """
     src = os.environ.get("VLLM_NVFP4_KV_CALIB")
     if not src:
         return None
@@ -78,10 +122,16 @@ def calibrated_kv_scales(hf_config: Any) -> Optional[Tuple[float, float]]:
             return None
     if not d:
         return None
-    k, v = d.get("k_scale"), d.get("v_scale")
-    if k is None or v is None:
-        return None
-    try:
-        return float(k), float(v)
-    except (TypeError, ValueError):
-        return None
+    layer_scales = d.get("layer_scales")
+    if layer_idx is not None and isinstance(layer_scales, dict):
+        pair = _scale_pair(layer_scales.get(str(layer_idx)))
+        if pair is not None:
+            return pair
+    if layer_type is None:
+        layer_type = _layer_type(hf_config, layer_idx)
+    type_scales = d.get("layer_type_scales") or d.get("attention_type_scales")
+    if layer_type and isinstance(type_scales, dict):
+        pair = _scale_pair(type_scales.get(str(layer_type)))
+        if pair is not None:
+            return pair
+    return _scale_pair(d)
