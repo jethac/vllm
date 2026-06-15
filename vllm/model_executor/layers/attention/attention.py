@@ -119,13 +119,16 @@ def set_default_quant_scales(layer: nn.Module, register_buffer: bool = False) ->
     layer.k_range = torch.tensor(envs.K_SCALE_CONSTANT, dtype=torch.float32)
     layer.v_range = torch.tensor(envs.V_SCALE_CONSTANT, dtype=torch.float32)
 
-    # NVFP4 KV calibrated global-scale override (productionized calibration policy).
-    # Replaces the uncalibrated 1.0 placeholder with a per-model calibrated scale when one is
-    # configured via VLLM_NVFP4_KV_CALIB; no-op otherwise (additive, opt-in).
+def _apply_nvfp4_kv_calib(layer: nn.Module, prefix: str) -> None:
+    # NVFP4 KV calibrated scale override (productionized calibration policy).
+    # Replaces the uncalibrated 1.0 placeholder with a calibrated scale when one is
+    # configured via VLLM_NVFP4_KV_CALIB; no-op otherwise (additive, opt-in). The
+    # calibration can optionally specialize by layer index or config.layer_types.
     try:
         import os as _os
         from vllm.nvfp4_kv_calib import calibrated_kv_scales
         from vllm.config import get_current_vllm_config as _gcvc
+        from vllm.model_executor.models.utils import extract_layer_index
         _vc = _gcvc()
         _cc = getattr(_vc, 'cache_config', None)
         # Gate to the FA2 nvfp4 path this scale was calibrated on (consumer/SoC Blackwell,
@@ -137,7 +140,19 @@ def set_default_quant_scales(layer: nn.Module, register_buffer: bool = False) ->
             # fine-tunes/merges/re-uploads of the same arch share the calibration.
             _mc = getattr(_vc, 'model_config', None)
             _hf = getattr(_mc, 'hf_config', None) if _mc is not None else None
-            _cal = calibrated_kv_scales(_hf)
+            try:
+                _layer_idx = extract_layer_index(prefix)
+            except Exception:
+                _layer_idx = None
+            _layer_type = None
+            if _layer_idx is not None:
+                _types = getattr(_hf, "layer_types", None)
+                if _types is None and getattr(_hf, "text_config", None) is not None:
+                    _types = getattr(_hf.text_config, "layer_types", None)
+                if _types and 0 <= _layer_idx < len(_types):
+                    _layer_type = str(_types[_layer_idx])
+            _cal = calibrated_kv_scales(
+                _hf, layer_idx=_layer_idx, layer_type=_layer_type)
             if _cal is not None:
                 layer._k_scale.fill_(_cal[0]); layer._v_scale.fill_(_cal[1])
                 layer._k_scale_float = float(_cal[0]); layer._v_scale_float = float(_cal[1])
@@ -177,6 +192,7 @@ def _init_kv_cache_quant(
     # wrong scales) and then load real weights (which misses scales and keeps the
     # wrong scales from dummy load).
     set_default_quant_scales(layer, register_buffer=True)
+    _apply_nvfp4_kv_calib(layer, prefix)
 
     # The output scale on host memory. This should be the input scale of
     # the quant op after this attention layer.
@@ -622,6 +638,7 @@ class Attention(nn.Module, AttentionLayerBase):
         )
         if not should_load_quant_weights(quant_method):
             set_default_quant_scales(self, register_buffer=False)
+            _apply_nvfp4_kv_calib(self, self.layer_name)
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.attn_backend
