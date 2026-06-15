@@ -1238,7 +1238,7 @@ class FlashInferBackend(AttentionBackend):
         has_sink: bool,
         use_sparse: bool,
         use_mm_prefix: bool,
-        device_capability: DeviceCapability,
+        device_capability: "DeviceCapability | None" = None,
     ) -> str | None:
         """Make selector truth match kernel truth for head_size > 256 on
         CC 12.x (the banked selector-vs-kernel head-512 discrepancy).
@@ -1265,7 +1265,13 @@ class FlashInferBackend(AttentionBackend):
         custom-mask path was probe/serving-validated on (bf16/"auto" and
         NVFP4). fp8 KV mm spans keep upstream routing unless
         VLLM_FLASHINFER_MM_PREFIX=1 is set explicitly.
+
+        (device_capability defaults to the live platform when the caller — e.g.
+        v0.23.0's validate_configuration — omits it; the e3 rebase decoupled the
+        two signatures.)
         """
+        if device_capability is None:
+            device_capability = current_platform.get_device_capability()
         if (
             use_mm_prefix
             and device_capability.major == 12
