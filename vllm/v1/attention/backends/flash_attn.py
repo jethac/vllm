@@ -813,7 +813,7 @@ class FlashAttentionImpl(AttentionImpl):
                         sliding_window_size[0],
                     ]
 
-                mm_prefix_ranges = attn_metadata.mm_prefix_range_tensor
+                mm_prefix_ranges = getattr(attn_metadata, "mm_prefix_range_tensor", None)
                 mm_mask_mod = None
                 mm_aux = None
                 if (
