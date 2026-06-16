@@ -7142,12 +7142,22 @@ class GPUModelRunner(
                     else:
                         shape_block_size = kernel_block_size
 
+                    # Per-group cache dtype: with mixed KV dtypes
+                    # (kv_cache_dtype_skip_layers), the global cache_dtype no
+                    # longer describes every group. The off-dtype group's shape
+                    # (e.g. fp8 uses head_size; nvfp4 uses a packed last-dim)
+                    # must use the group's own resolved dtype, or the raw-tensor
+                    # view mismatches (fp8 buffer reshaped to the nvfp4 shape).
+                    group_cache_dtype = (
+                        getattr(kv_cache_spec, "cache_dtype_str", None)
+                        or self.cache_config.cache_dtype
+                    )
                     kv_cache_shape = attn_backend.get_kv_cache_shape(
                         kernel_num_blocks,
                         shape_block_size,
                         kv_cache_spec.num_kv_heads,
                         kv_cache_spec.head_size,
-                        cache_dtype_str=self.cache_config.cache_dtype,
+                        cache_dtype_str=group_cache_dtype,
                     )
                     dtype = kv_cache_spec.dtype
                     try:
@@ -7241,11 +7251,17 @@ class GPUModelRunner(
             kv_cache_spec = group.kv_cache_spec
             if not isinstance(kv_cache_spec, AttentionSpec):
                 continue
+            # Per-group cache dtype (see _reshape_kv_cache_tensors): mixed KV
+            # dtypes mean the global cache_dtype may not describe this group.
+            group_cache_dtype = (
+                getattr(kv_cache_spec, "cache_dtype_str", None)
+                or self.cache_config.cache_dtype
+            )
             block_dim = group.backend.get_kv_cache_block_dim(
                 kernel_block_sizes[group.kv_cache_group_id],
                 kv_cache_spec.num_kv_heads,
                 kv_cache_spec.head_size,
-                cache_dtype_str=self.cache_config.cache_dtype,
+                cache_dtype_str=group_cache_dtype,
             )
             # block_dim: 0 means (num_blocks, 2, ...); 1 means (2, num_blocks, ...).
             if block_dim == 0:
