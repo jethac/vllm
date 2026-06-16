@@ -304,24 +304,53 @@ class Attention(nn.Module, AttentionLayerBase):
             and kv_cache_scheme.get("strategy") == "attn_head"
         )
 
-        # Skip quantization for specified layers
+        # Skip or override quantization for specified layers. Entries are
+        # "<matcher>" (sliding_window, full_attention, or a layer index),
+        # which falls matched layers back to the model dtype, or
+        # "<matcher>=<kv_cache_dtype>", which gives matched layers a
+        # different cache dtype (e.g. "full_attention=fp8_e4m3" keeps fp8 KV
+        # on global layers while the rest of the model uses the main
+        # --kv-cache-dtype). Layer-index entries win over type entries.
         if cache_config is not None and cache_config.kv_cache_dtype_skip_layers:
             from vllm.model_executor.models.utils import extract_layer_index
 
-            skip = False
-            # Check attention type
-            if (
-                sliding_window is not None
-                and "sliding_window" in cache_config.kv_cache_dtype_skip_layers
-            ):
-                skip = True
-            # Check layer index
+            def _match_skip_entry(token: str) -> str | None:
+                for entry in cache_config.kv_cache_dtype_skip_layers:
+                    key, sep, value = entry.partition("=")
+                    if key == token:
+                        return value if sep else "auto"
+                return None
+
             layer_idx = extract_layer_index(prefix)
-            if str(layer_idx) in cache_config.kv_cache_dtype_skip_layers:
-                skip = True
-            if skip:
-                kv_cache_dtype = "auto"
-                calculate_kv_scales = False
+            fallback = _match_skip_entry(str(layer_idx))
+            if fallback is None and sliding_window is not None:
+                fallback = _match_skip_entry("sliding_window")
+            if fallback is None and sliding_window is None:
+                # Full/global-attention layers (no sliding window). Lets
+                # hybrid-SWA models keep quantized KV on the local layers
+                # while the global layers (e.g. Gemma 4 D=512, unsupported
+                # by the FP4 attention kernels) fall back or override.
+                fallback = _match_skip_entry("full_attention")
+            if fallback is not None:
+                from typing import get_args as _get_args
+
+                from vllm.config.cache import CacheDType
+
+                if fallback != "auto" and fallback not in _get_args(CacheDType):
+                    raise ValueError(
+                        f"Invalid kv_cache_dtype override {fallback!r} in "
+                        f"kv_cache_dtype_skip_layers. Valid values: 'auto' "
+                        f"or one of {_get_args(CacheDType)}."
+                    )
+                kv_cache_dtype = fallback
+                # "auto" (model dtype, e.g. bf16) needs no KV scales, but a
+                # quantized override (e.g. fp8_e4m3) does -- forcing scales off
+                # made override layers run at an uncalibrated scale of 1.0. Keep
+                # the configured calculate_kv_scales for quantized overrides.
+                if fallback == "auto":
+                    calculate_kv_scales = False
+                else:
+                    calculate_kv_scales = cache_config.calculate_kv_scales
             logger.debug(
                 "Layer %s: kv_cache_dtype=%s, sliding_window=%s",
                 prefix,
