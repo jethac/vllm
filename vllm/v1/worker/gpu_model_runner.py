@@ -148,6 +148,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    KVQuantMode,
     KVCacheSpec,
     MambaSpec,
     SlidingWindowSpec,
@@ -230,6 +231,24 @@ if TYPE_CHECKING:
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 logger = init_logger(__name__)
+
+
+def _resolve_group_cache_dtype(
+    kv_cache_spec: KVCacheSpec, cache_dtype: str
+) -> str:
+    """Resolve the cache dtype string for one KV cache group.
+
+    In mixed per-layer KV configurations, the global cache dtype can be
+    quantized while individual groups fall back to unquantized ``auto``. Such
+    groups have ``cache_dtype_str=None`` and ``kv_quant_mode=NONE``; letting
+    them inherit the global dtype gives them the wrong packed cache shape.
+    """
+    spec_dtype_str = getattr(kv_cache_spec, "cache_dtype_str", None)
+    if spec_dtype_str is not None:
+        return spec_dtype_str
+    if getattr(kv_cache_spec, "kv_quant_mode", KVQuantMode.NONE) == KVQuantMode.NONE:
+        return "auto"
+    return cache_dtype
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -7148,9 +7167,8 @@ class GPUModelRunner(
                     # (e.g. fp8 uses head_size; nvfp4 uses a packed last-dim)
                     # must use the group's own resolved dtype, or the raw-tensor
                     # view mismatches (fp8 buffer reshaped to the nvfp4 shape).
-                    group_cache_dtype = (
-                        getattr(kv_cache_spec, "cache_dtype_str", None)
-                        or self.cache_config.cache_dtype
+                    group_cache_dtype = _resolve_group_cache_dtype(
+                        kv_cache_spec, self.cache_config.cache_dtype
                     )
                     kv_cache_shape = attn_backend.get_kv_cache_shape(
                         kernel_num_blocks,
@@ -7253,9 +7271,8 @@ class GPUModelRunner(
                 continue
             # Per-group cache dtype (see _reshape_kv_cache_tensors): mixed KV
             # dtypes mean the global cache_dtype may not describe this group.
-            group_cache_dtype = (
-                getattr(kv_cache_spec, "cache_dtype_str", None)
-                or self.cache_config.cache_dtype
+            group_cache_dtype = _resolve_group_cache_dtype(
+                kv_cache_spec, self.cache_config.cache_dtype
             )
             block_dim = group.backend.get_kv_cache_block_dim(
                 kernel_block_sizes[group.kv_cache_group_id],

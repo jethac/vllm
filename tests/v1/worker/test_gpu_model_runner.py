@@ -39,18 +39,54 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    KVQuantMode,
     KVCacheTensor,
 )
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.worker.gpu_input_batch import InputBatch
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+from vllm.v1.worker.gpu_model_runner import (
+    GPUModelRunner,
+    _resolve_group_cache_dtype,
+)
 from vllm.v1.worker.utils import select_common_block_size
 
 BLOCK_SIZE = 16
 NUM_BLOCKS = 10
 DEVICE_TYPE = current_platform.device_type
+
+
+def test_resolve_group_cache_dtype_keeps_auto_override_unpacked():
+    unquantized_override = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=8,
+        head_size=256,
+        dtype=torch.bfloat16,
+    )
+    assert unquantized_override.cache_dtype_str is None
+    assert unquantized_override.kv_quant_mode == KVQuantMode.NONE
+    assert _resolve_group_cache_dtype(unquantized_override, "nvfp4") == "auto"
+
+    fp8_override = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=8,
+        head_size=256,
+        dtype=torch.float8_e4m3fn,
+        kv_quant_mode=KVQuantMode.FP8_PER_TENSOR,
+        cache_dtype_str="fp8_e4m3",
+    )
+    assert _resolve_group_cache_dtype(fp8_override, "nvfp4") == "fp8_e4m3"
+
+    nvfp4_base = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=2,
+        head_size=512,
+        dtype=torch.uint8,
+        kv_quant_mode=KVQuantMode.NVFP4,
+        cache_dtype_str="nvfp4",
+    )
+    assert _resolve_group_cache_dtype(nvfp4_base, "nvfp4") == "nvfp4"
 
 
 def initialize_kv_cache(runner: GPUModelRunner):
