@@ -1057,11 +1057,42 @@ def unify_kv_cache_spec_page_size(
             ratio = max_page_size // layer_page_size
             if max_page_size % layer_page_size != 0:
                 # Mixed per-layer KV dtypes (e.g. NVFP4 sliding-window KV
-                # with bf16/fp8 global KV) rarely divide evenly. Scale the
-                # block size to the largest whole multiple that fits, then
-                # pad the remainder so physical page sizes still match.
-                # Scaling by an integer preserves any multiple-of block
-                # size constraint the original block size satisfied.
+                # with bf16/fp8 global KV) rarely divide evenly. For standard
+                # attention, do not increase block_size before padding: the
+                # model runner materializes cache tensors as kernel-block rows,
+                # and a padded logical page containing multiple kernel blocks
+                # cannot be represented by a single 5D as_strided view (there
+                # would be a padding gap only after every Nth kernel block).
+                #
+                # Instead, keep one kernel block per padded page. This wastes
+                # more memory for the smaller-page layer but preserves a
+                # representable layout.
+                if (
+                    isinstance(layer_spec, AttentionSpec)
+                    and layer_spec.storage_block_size == layer_spec.block_size
+                ):
+                    new_spec = replace(layer_spec, page_size_padded=max_page_size)
+                    waste = max_page_size - layer_page_size
+                    logger.warning(
+                        "Padding KV cache pages of layer %s from %d to %d "
+                        "bytes (block_size %d unchanged, %.2f%% of this "
+                        "layer's pool wasted) to unify page sizes across "
+                        "mixed KV specs.",
+                        layer_name,
+                        layer_page_size,
+                        max_page_size,
+                        layer_spec.block_size,
+                        100.0 * waste / max_page_size,
+                    )
+                    assert new_spec.page_size_bytes == max_page_size
+                    new_kv_cache_spec[layer_name] = new_spec
+                    continue
+
+                # Other cache layouts can still scale the block size to the
+                # largest whole multiple that fits, then pad the remainder so
+                # physical page sizes match. Scaling by an integer preserves
+                # any multiple-of block size constraint the original block size
+                # satisfied.
                 if ratio == 0:
                     raise NotImplementedError(
                         "Cannot unify page sizes: a single block of the "
