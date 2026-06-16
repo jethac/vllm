@@ -1465,8 +1465,27 @@ class Gemma4ForConditionalGeneration(
         self,
         audio_input: Gemma4AudioInputs,
     ) -> list[torch.Tensor]:
-        input_features = audio_input["input_features_padded"].squeeze(1)
-        input_features_mask = audio_input["input_features_mask"].squeeze(1)
+        feats = audio_input["input_features_padded"]
+        masks = audio_input["input_features_mask"]
+        if isinstance(feats, (list, tuple)):
+            # Variable-length audios arrive unstacked: the batched() re-pad is a
+            # no-op when per-item MEL frame counts differ, so they stay a list.
+            # Pad to the batch max and stack into a single [bn, s_max, f] tensor.
+            feats = [f.squeeze(0) if f.dim() == 3 and f.shape[0] == 1 else f
+                     for f in feats]
+            masks = [m.squeeze(0) if m.dim() == 2 and m.shape[0] == 1 else m
+                     for m in masks]
+            bn = len(feats)
+            s_max = max(f.shape[-2] for f in feats)
+            fdim = feats[0].shape[-1]
+            input_features = feats[0].new_zeros((bn, s_max, fdim))
+            input_features_mask = masks[0].new_zeros((bn, s_max), dtype=torch.bool)
+            for i, (f, m) in enumerate(zip(feats, masks)):
+                input_features[i, : f.shape[-2]] = f
+                input_features_mask[i, : m.shape[-1]] = m.to(torch.bool)
+        else:
+            input_features = feats.squeeze(1)
+            input_features_mask = masks.squeeze(1)
 
         # Run audio tower — mask convention: True=valid, False=padding.
         audio_outputs = self.audio_tower(input_features, input_features_mask)
