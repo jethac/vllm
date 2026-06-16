@@ -45,6 +45,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     KVCacheSpecKind,
     KVCacheTensor,
+    KVQuantMode,
     MambaSpec,
     MLAAttentionSpec,
     SinkFullAttentionSpec,
@@ -180,6 +181,60 @@ def new_mamba_spec(
         mamba_cache_mode=mamba_cache_mode,
         num_speculative_blocks=num_speculative_blocks,
     )
+
+
+def test_unify_page_size_keeps_standard_attention_block_size_when_padding():
+    # Regression for mixed Gemma 4 26B-A4B KV specs:
+    # a selected fp8 sliding layer has 65536-byte pages, while an unselected
+    # NVFP4 global layer has 18432-byte pages. 65536 is not divisible by
+    # 18432. Scaling the NVFP4 global block from 16 to 48 and then padding
+    # creates an unrepresentable standard-attention 5D view: the runner splits
+    # the logical page into three 16-token kernel blocks, but the padding gap
+    # exists only after every third kernel block.
+    fp8_selected = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=8,
+        head_size=256,
+        dtype=torch.float8_e4m3fn,
+        cache_dtype_str="fp8_e4m3",
+    )
+    nvfp4_global = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=2,
+        head_size=512,
+        dtype=torch.uint8,
+        kv_quant_mode=KVQuantMode.NVFP4,
+        cache_dtype_str="nvfp4",
+    )
+    assert fp8_selected.page_size_bytes == 65536
+    assert nvfp4_global.real_page_size_bytes == 18432
+
+    unified = kv_cache_utils.unify_kv_cache_spec_page_size(
+        {
+            "fp8_selected": fp8_selected,
+            "nvfp4_global": nvfp4_global,
+        }
+    )
+
+    padded = unified["nvfp4_global"]
+    assert padded.block_size == 16
+    assert padded.page_size_padded == 65536
+    assert padded.page_size_bytes == 65536
+
+    # Match the failing live row's allocation size. With block_size unchanged,
+    # one padded logical page is one kernel block row, so as_strided stays
+    # within the raw allocation.
+    num_pages = 83399
+    raw_bytes = num_pages * padded.page_size_bytes
+    kernel_block_size = 16
+    kernel_num_blocks = num_pages * (padded.block_size // kernel_block_size)
+    assert kernel_num_blocks == num_pages
+
+    full_dim = 288  # nvfp4_kv_cache_full_dim(512)
+    shape = (kernel_num_blocks, 2, kernel_block_size, padded.num_kv_heads, full_dim)
+    stride = (padded.page_size_bytes, 9216, 576, full_dim, 1)
+    required = sum((size - 1) * step for size, step in zip(shape, stride)) + 1
+    assert required <= raw_bytes
 
 
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
