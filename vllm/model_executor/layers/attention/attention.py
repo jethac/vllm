@@ -330,7 +330,14 @@ class Attention(nn.Module, AttentionLayerBase):
                         f"or one of {_get_args(CacheDType)}."
                     )
                 kv_cache_dtype = fallback
-                calculate_kv_scales = False
+                # "auto" (model dtype, e.g. bf16) needs no KV scales, but a
+                # quantized override (e.g. fp8_e4m3) does -- forcing scales off
+                # made override layers run at an uncalibrated scale of 1.0. Keep
+                # the configured calculate_kv_scales for quantized overrides.
+                if fallback == "auto":
+                    calculate_kv_scales = False
+                else:
+                    calculate_kv_scales = cache_config.calculate_kv_scales
             logger.debug(
                 "Layer %s: kv_cache_dtype=%s, sliding_window=%s",
                 prefix,
