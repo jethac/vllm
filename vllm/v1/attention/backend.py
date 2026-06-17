@@ -267,6 +267,7 @@ class AttentionBackend(ABC):
         use_mla: bool,
         has_sink: bool,
         use_sparse: bool,
+        use_mm_prefix: bool,
         device_capability: "DeviceCapability",
     ) -> str | None:
         return None
@@ -334,6 +335,7 @@ class AttentionBackend(ABC):
             use_mla,
             has_sink,
             use_sparse,
+            use_mm_prefix,
             device_capability,
         )
         if combination_reason is not None:
@@ -416,11 +418,10 @@ class CommonAttentionMetadata:
     that need exact per-row context lengths on decode rows."""
 
     mm_req_doc_ranges: dict[int, list[tuple[int, int]]] | None = None
-    """PrefixLM bidirectional ranges for multimodal tokens. Maps request index
-    to list of (start, end) token position ranges where bidirectional attention
-    should apply. None for text-only batches or non-PrefixLM models. (e3 rebase:
-    re-added — the field def was dropped in cherry-pick conflict resolution while
-    the flashinfer.py reference survived.)"""
+    """PrefixLM bidirectional ranges for multimodal tokens. Maps
+    request index to list of (start, end) token position ranges
+    where bidirectional attention should apply. None for text-only
+    batches or non-PrefixLM models."""
 
     # WARNING: Deprecated fields. Will be removed in a future release (v0.15.0)
     _seq_lens_cpu: torch.Tensor | None = None
@@ -898,6 +899,7 @@ class MLAAttentionImpl(AttentionImplBase[T], Generic[T]):
         attn_metadata: T,
         k_scale: torch.Tensor,
         output: torch.Tensor,
+        output_scale: torch.Tensor | None = None,
     ) -> None:
         """MHA-style prefill forward pass."""
         raise NotImplementedError

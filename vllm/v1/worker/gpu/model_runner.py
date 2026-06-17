@@ -37,7 +37,6 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
-from vllm.lora.layers import LoRAMapping
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
@@ -88,8 +87,14 @@ from vllm.v1.worker.gpu.kv_connector import (
     KVConnector,
     get_kv_connector,
 )
-from vllm.v1.worker.gpu.lora_utils import LoraState
+from vllm.v1.worker.gpu.lora_utils import (
+    LoraState,
+    create_lora_capture_hook,
+    get_lora_capture_cases,
+    get_num_active_loras_for_dispatch,
+)
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
+from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
 from vllm.v1.worker.gpu.model_states import init_model_state
 from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
 from vllm.v1.worker.gpu.pp_utils import PPHandler
@@ -144,7 +149,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.max_num_reqs = self.scheduler_config.max_num_seqs
         self.is_encoder_decoder = self.model_config.is_encoder_decoder
 
-        self.use_async_scheduling = self.scheduler_config.async_scheduling
         self.output_copy_stream = torch.cuda.Stream(self.device)
 
         # Pipeline parallelism.
@@ -189,11 +193,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.is_last_pp_rank:
                 self.speculator = init_speculator(self.vllm_config, self.device)
 
-            if self.speculative_config.method == "eagle3":
-                # EAGLE3 may require auxiliary hidden states from target model outputs.
+            if self.speculative_config.method in ("eagle3", "dflash"):
+                # Drafting may require auxiliary hidden states from target model outputs
                 self.use_aux_hidden_state_outputs = True
                 if self.use_pp:
-                    raise ValueError("EAGLE3 with pipeline parallel is not supported.")
+                    raise ValueError(
+                        f"{self.speculative_config.method} with pipeline parallel "
+                        "is not supported."
+                    )
 
         # Draft tokens propagation - for spec-dec + struct outputs.
         self.draft_tokens_handler = DraftTokensHandler(self.device)
@@ -231,8 +238,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.prompt_logprobs_worker: PromptLogprobsWorker | None = None
         self.structured_outputs_worker: StructuredOutputsWorker | None = None
         self.cudagraph_manager: ModelCudaGraphManager | None = None
+
         # LoRA-related workers.
         self.lora_state = LoraState(max_num_reqs=self.max_num_reqs)
+        self.lora_capture_cases = [0]
+        if self.lora_config:
+            self.lora_capture_cases = get_lora_capture_cases(
+                self.lora_config, self.compilation_config
+            )
+
         # KV Connector if configured.
         self.kv_connector: KVConnector = NO_OP_KV_CONNECTOR
 
@@ -363,8 +377,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         from vllm.v1.worker.gpu_model_runner import GPUModelRunner as GPUModelRunnerV1
 
         GPUModelRunnerV1.reload_weights(self, *args, **kwargs)  # type: ignore[arg-type]
-        self.reset_encoder_cache()
-        self.reset_mm_cache()
 
     def apply_sparse_weight_patches(self, *args, **kwargs) -> None:
         # TODO: Use full version instead of import when fully migrated to v2
@@ -457,6 +469,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.device,
             cudagraph_mode,
             decode_query_len=self.decode_query_len,
+            lora_capture_cases=self.lora_capture_cases,
         )
         if self.speculator is not None:
             self.speculator.init_cudagraph_manager(cudagraph_mode)
@@ -539,14 +552,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             assert self.intermediate_tensors is not None
             intermediate_tensors = self.intermediate_tensors[:num_tokens]
 
-        # Execute the model.
-        self.execute_model(
-            dummy_scheduler_output,
-            intermediate_tensors=intermediate_tensors,
-            dummy_run=True,
-            skip_attn_for_dummy_run=skip_attn,
-            is_profile=is_profile,
-        )
+        max_loras = self.lora_config.max_loras if self.lora_config is not None else 0
+        with self.maybe_dummy_run_with_lora(
+            self.lora_config,
+            num_scheduled_tokens=np.array(num_tokens_per_request, dtype=np.int32),
+            num_sampled_tokens=None,
+            remove_lora=True,
+            num_active_loras=max_loras,
+        ):
+            # Execute the model.
+            self.execute_model(
+                dummy_scheduler_output,
+                intermediate_tensors=intermediate_tensors,
+                dummy_run=True,
+                skip_attn_for_dummy_run=skip_attn,
+                is_profile=is_profile,
+            )
         self.kv_connector.set_disabled(False)
 
         # Non-last PP ranks don't produce output for sampling.
@@ -693,6 +714,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.kv_cache_config,
                 has_lora=self.lora_config is not None,
                 use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
+                lora_capture_hook=create_lora_capture_hook(self.lora_config, self),
             )
             if self.speculator is not None:
                 self.speculator.capture(attn_states)
@@ -1104,6 +1126,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         max_query_len = max(scheduler_output.num_scheduled_tokens.values())
         uniform_tok_count = get_uniform_token_count(num_reqs, num_toks, max_query_len)
 
+        num_active_loras = 0
+        if self.lora_config:
+            req_ids = list(scheduler_output.num_scheduled_tokens.keys())
+            num_active_loras = get_num_active_loras_for_dispatch(
+                self.lora_config, self.lora_state, req_ids, dummy_run
+            )
+
         skip_compiled = False
         if self.is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
             # Encoder-decoder models such as Whisper should run eager/non-compiled
@@ -1119,6 +1148,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.dp_size,
             self.dp_rank,
             need_eager=is_profile or skip_compiled,
+            num_active_loras=num_active_loras,
         )
 
         if batch_desc.num_tokens == 0:
@@ -1156,31 +1186,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
                 block_tables = None
                 slot_mappings = None
-            if self.lora_config:
-                # program a no-LoRA mapping here so kernels early-exit instead of
-                # reading uninitialized metadata during dummy runs.
-                # FIXME: Replace this with LoRA warmup:
-                # https://github.com/vllm-project/vllm/pull/35536
-                assert hasattr(self, "lora_manager")
-                adapter_manager = self.lora_manager._adapter_manager
-                adapter_manager.set_adapter_mapping(
-                    LoRAMapping(
-                        index_mapping=(0,) * input_batch.num_tokens_after_padding,
-                        prompt_mapping=(0,) * input_batch.num_reqs,
-                        is_prefill=True,
-                    )
-                )
-                seen_wrappers: set[int] = set()
-                for punica_wrapper in adapter_manager.punica_wrapper_mapping.values():
-                    if id(punica_wrapper) in seen_wrappers:
-                        continue
-                    seen_wrappers.add(id(punica_wrapper))
-                    for kernel_meta in (
-                        punica_wrapper.token_mapping_meta,  # type: ignore[attr-defined]
-                        punica_wrapper.prompt_mapping_meta,  # type: ignore[attr-defined]
-                    ):
-                        kernel_meta.no_lora_flag_cpu[0] = False
-                        kernel_meta.num_active_loras_cpu[0] = 1
 
         attn_metadata = None
         slot_mappings_by_layer = None
@@ -1205,6 +1210,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Only first PP rank prepares multimodal embeddings.
             # NOTE(woosuk): We must call get_mm_embeddings even during dummy runs
             # to obtain inputs_embeds, because the compiled model expects this input.
+            if self.lora_config is not None:
+                set_active_mm_loras(
+                    model=self.model,
+                    lora_manager=self.lora_manager,
+                    encoder_cache=self.encoder_cache,
+                    req_id_to_index=self.req_states.req_id_to_index,
+                    lora_state=self.lora_state,
+                    scheduled_encoder_inputs=scheduler_output.scheduled_encoder_inputs,
+                )
             inputs_embeds = self.model_state.get_mm_embeddings(
                 scheduler_output.scheduled_encoder_inputs, input_batch
             )
@@ -1248,6 +1262,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             batch_descriptor = BatchDescriptor(
                 num_tokens=input_batch.num_tokens_after_padding,
                 has_lora=self.lora_config is not None,
+                num_active_loras=batch_desc.num_active_loras,
             )
 
             with set_forward_context(
@@ -1446,9 +1461,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
         model_runner_output.kv_connector_output = kv_connector_output
 
-        if self.use_async_scheduling:
-            return async_output
-        return async_output.get_output()
+        return async_output
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.draft_tokens_handler.get_draft_tokens()
@@ -1492,9 +1505,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         self.postprocess_num_computed_tokens(input_batch)
-        if self.use_async_scheduling:
-            return async_output
-        return async_output.get_output()
+        return async_output
 
     def postprocess_num_computed_tokens(self, input_batch: InputBatch) -> None:
         # Update the number of computed tokens.
