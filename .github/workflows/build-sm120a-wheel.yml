@@ -1,0 +1,277 @@
+# dgx-spark-hijinks campaign: CI sm_120a vLLM wheel for the Colab G4 lane.
+#
+# KEY ECONOMICS: compiling vLLM needs NO GPU, only nvcc. This workflow exists so
+# that Colab G4 runtimes (RTX PRO 6000 Blackwell, CC 12.0) and the P520 never
+# compile vLLM again: GitHub Actions builds the sm_120a wheel once per push and
+# publishes it to a Release; the notebook just `pip install`s the release asset.
+# (A Colab source build burned 1-2 h of paid GPU time per fresh runtime; the
+# P520 build occupied the only local sm_120 box for hours. Both are retired.)
+#
+# Recipe provenance (campaign known-good combo, do not drift):
+#   - CUDA 13.0 via NVIDIA apt repo (cuda-keyring + cuda-toolkit-13-0): the same
+#     wholesale apt path verified on Colab (notebook DINGO->JACKAL) and P520 WSL2
+#     (wsl_sm120/01_cuda.sh). The pip "nvcc" cu13 wheel is ptxas-only - dead end.
+#   - torch ==2.12.0 from the cu130 index: matches the P520 sm_120 serving env
+#     (docs/BUG_FLASHINFER_GEMMA3_1B_SERVING_NUMERICS.md environment block) so
+#     the wheel's torch ABI matches what the notebook installs.
+#   - use-existing-torch pattern: python use_existing_torch.py, then
+#     pip install -r requirements/build/cuda.txt, then
+#     pip wheel --no-build-isolation (the exact P520 build_vllm_hijinks.sh
+#     pattern, swapping `pip install -e .` for a wheel build).
+#   - TORCH_CUDA_ARCH_LIST=12.0a: single-arch sm_120a, the campaign target.
+#
+# FlashInfer is deliberately NOT wheel-built here: the campaign runs
+# jethac/flashinfer @ spark/hijinks-022-fa2-d512 as a source tree with runtime
+# JIT (known-good on Colab with the apt cuda-toolkit and on P520). JIT compiles
+# only the kernels actually used, keyed to the live GPU, so an AOT wheel would
+# add build hours for no install-time win. See docs/COLAB_G4_LANE.md in the
+# campaign repo.
+#
+# 6-hour-limit design: the build step has its own timeout and tolerates failure;
+# ccache state is ALWAYS saved (actions/cache/save with always()). If a cold
+# build ever exceeds the job limit, simply re-run the workflow: the second run
+# restores the ccache and finishes from where compilation got. The final gate
+# step fails the run loudly when the wheel is missing so a half-built run is
+# never released.
+
+name: build-sm120a-wheel
+
+on:
+  push:
+    branches:
+      - spark/hijinks-e2-vllm
+      - spark/hijinks-e2-dgv
+    paths-ignore:
+      - ".github/workflows/build-sm121a-arm64-wheel.yml"
+  workflow_dispatch:
+    inputs:
+      release_tag_suffix:
+        description: "Optional suffix appended to the release tag (e.g. -retry1)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write # gh release create
+
+concurrency:
+  group: build-sm120a-wheel-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TORCH_VERSION: "2.12.0" # campaign pin: P520 sm_120 env is torch 2.12.0+cu130
+  TORCH_INDEX_URL: "https://download.pytorch.org/whl/cu130"
+  CUDA_HOME: /usr/local/cuda-13.0
+
+jobs:
+  build-wheel:
+    # Ubicloud keeps this CPU-heavy nvcc build off local machines and off the
+    # Spark. The 30-vCPU shape gives enough CPU/RAM/disk for a single-arch
+    # sm_120a wheel while staying within the hosted runner integration.
+    # Colab G4 currently runs Ubuntu 22.04 / glibc 2.35. Build on the same
+    # base so the wheel does not pick up newer glibc symbols from Ubuntu 24.04.
+    runs-on: ubicloud-standard-30-ubuntu-2204
+    timeout-minutes: 355
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Free disk space (CUDA toolkit + torch cu130 + build tree need ~40 GB)
+        run: |
+          set -x
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      /usr/local/.ghcup /usr/share/swift || true
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Set up Python 3.12 (matches Colab G4 runtime python)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install CUDA 13.0 toolkit (NVIDIA apt repo - campaign known-good path)
+        run: |
+          set -euxo pipefail
+          source /etc/os-release
+          UBREPO="ubuntu$(echo "${VERSION_ID}" | tr -d .)"
+          wget -q "https://developer.download.nvidia.com/compute/cuda/repos/${UBREPO}/x86_64/cuda-keyring_1.1-1_all.deb" -O /tmp/cuda-keyring.deb
+          sudo dpkg -i /tmp/cuda-keyring.deb
+          sudo apt-get -qq update
+          # Wholesale toolkit, not a minimal package set: the minimal set cost
+          # five round-trips on Colab (nvcc, nvrtc, cusparse, cublas, ...).
+          sudo apt-get -qq install -y cuda-toolkit-13-0 ccache
+          ${CUDA_HOME}/bin/nvcc --version
+
+      - name: Restore ccache (the 6h-limit escape hatch)
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/ccache
+          key: sm120a-ccache-${{ github.sha }}
+          restore-keys: |
+            sm120a-ccache-
+
+      - name: Install torch cu130 + build requirements (use-existing-torch pattern)
+        run: |
+          set -euxo pipefail
+          pip install "torch==${TORCH_VERSION}" --index-url "${TORCH_INDEX_URL}"
+          # Strip torch pins from vLLM's requirement files so the build links
+          # against the cu130 torch installed above (campaign pattern).
+          python use_existing_torch.py
+          pip install -r requirements/build/cuda.txt
+          python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)"
+
+      - name: Build sm_120a wheel
+        id: build
+        # Own timeout + continue-on-error so the ccache save below ALWAYS runs;
+        # the "Require wheel" gate fails the job if no wheel was produced.
+        timeout-minutes: 320
+        continue-on-error: true
+        env:
+          TORCH_CUDA_ARCH_LIST: "12.0a"
+          VLLM_MAIN_CUDA_VERSION: "13.0"
+          VLLM_TARGET_DEVICE: cuda
+          MAX_JOBS: "20" # ubicloud-standard-30: leave memory headroom for nvcc
+          NVCC_THREADS: "1"
+          CMAKE_BUILD_PARALLEL_LEVEL: "20"
+          CMAKE_C_COMPILER_LAUNCHER: ccache
+          CMAKE_CXX_COMPILER_LAUNCHER: ccache
+          CMAKE_CUDA_COMPILER_LAUNCHER: ccache
+          CCACHE_MAXSIZE: 20G
+        run: |
+          set -euxo pipefail
+          export PATH="${CUDA_HOME}/bin:${PATH}"
+          SHORTSHA="$(git rev-parse --short=9 HEAD)"
+          # Deterministic version => deterministic wheel filename for the
+          # notebook's templated release URL.
+          export VLLM_VERSION_OVERRIDE="0.1.dev1+g${SHORTSHA}.sm120a"
+          export SETUPTOOLS_SCM_PRETEND_VERSION="${VLLM_VERSION_OVERRIDE}"
+          ccache --zero-stats || true
+          pip wheel --no-build-isolation --no-deps -w dist . -v
+          ccache --show-stats || true
+          ls -la dist/
+
+      - name: Save ccache (always - this is what makes a re-run resume)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/ccache
+          key: sm120a-ccache-${{ github.sha }}
+
+      - name: Require wheel (fail loudly if the build step timed out / failed)
+        run: |
+          set -euxo pipefail
+          ls dist/vllm-*.whl || {
+            echo "::error::No wheel produced. If the build step hit its timeout,"
+            echo "::error::RE-RUN this workflow: ccache was saved and the second"
+            echo "::error::pass resumes compilation instead of starting cold."
+            exit 1
+          }
+
+      - name: Import smoke - install wheel + import the rebase-touched modules (no GPU needed)
+        # The rebase onto upstream/main is Python-heavy (attention backends,
+        # engine core, model runner, config routing). A wheel build alone is
+        # import-less, so it would not catch an import/symbol error from the
+        # merge resolution. Install the wheel and import the touched modules.
+        run: |
+          set -euxo pipefail
+          pip install "dist/$(ls dist | grep -E 'vllm-.*\.whl' | head -1)"
+          python - <<'PY'
+          import importlib
+          mods = [
+              "vllm",
+              "vllm.v1.attention.backends.flashinfer",
+              "vllm.v1.attention.backends.flash_attn",
+              "vllm.v1.engine.core",
+              "vllm.v1.worker.gpu_model_runner",
+              "vllm.v1.core.sched.scheduler",
+              "vllm.v1.core.single_type_kv_cache_manager",
+              "vllm.model_executor.models.config",
+              "vllm.platforms.cuda",
+          ]
+          for m in mods:
+              importlib.import_module(m)
+              print("import OK:", m)
+          print("ALL REBASE-TOUCHED MODULES IMPORT CLEANLY")
+          PY
+
+      - name: Sanity - wheel metadata + sm_120a cubin audit (import-less; no GPU on runner)
+        run: |
+          set -euxo pipefail
+          WHEEL="$(ls dist/vllm-*.whl)"
+          mkdir -p /tmp/wheel_audit
+          unzip -q "${WHEEL}" -d /tmp/wheel_audit
+          echo "=== METADATA head ==="
+          find /tmp/wheel_audit -name METADATA -path "*dist-info*" | head -1 | xargs sed -n '1,12p'
+          echo "=== bundled .so inventory ==="
+          find /tmp/wheel_audit -name "*.so" -size +1M | sort
+          echo "=== cuobjdump arch audit (expect sm_120a, no stray arch-only payloads) ==="
+          FAIL=0
+          # Enforce sm_120a on vLLM's core extensions. The bundled FA2/FA3
+          # compatibility extensions may carry upstream legacy cubins and are
+          # not the campaign's Gemma/FlashInfer execution path; print them
+          # below as informational provenance instead of failing the wheel.
+          for so in $(find /tmp/wheel_audit -name "_C*.abi3.so" -o -name "_moe_C*.abi3.so"); do
+            echo "--- ${so}"
+            ${CUDA_HOME}/bin/cuobjdump -lelf "${so}" > /tmp/cuobj.txt 2>&1 || { echo "(no ELF payload)"; continue; }
+            grep -oE 'sm_[0-9]+a?' /tmp/cuobj.txt | sort | uniq -c
+            grep -q 'sm_120a' /tmp/cuobj.txt || { echo "::error::${so} contains no sm_120a cubins"; FAIL=1; }
+            MAXGLIBC="$(
+              objdump -T "${so}" 2>/dev/null \
+                | grep -oE 'GLIBC_[0-9]+\.[0-9]+' \
+                | sort -V \
+                | tail -1 \
+                || true
+            )"
+            echo "max_glibc=${MAXGLIBC:-none}"
+            if [[ -n "${MAXGLIBC}" ]]; then
+              GLIBC_CEILING="$(printf '%s\n2.35\n' "${MAXGLIBC#GLIBC_}" | sort -V | tail -1)"
+              if [[ "${GLIBC_CEILING}" != "2.35" ]]; then
+                echo "::error::${so} needs ${MAXGLIBC} > GLIBC_2.35 (won't load on Colab G4 / Ubuntu 22.04)"
+                FAIL=1
+              fi
+            fi
+          done
+          test "${FAIL}" = "0"
+          echo "=== informational FA extension arch inventory ==="
+          for so in $(find /tmp/wheel_audit -name "_vllm_fa2_C*.abi3.so" -o -name "_vllm_fa3_C*.abi3.so"); do
+            echo "--- ${so}"
+            ${CUDA_HOME}/bin/cuobjdump -lelf "${so}" > /tmp/cuobj.txt 2>&1 || { echo "(no ELF payload)"; continue; }
+            grep -oE 'sm_[0-9]+a?' /tmp/cuobj.txt | sort | uniq -c || true
+          done
+          # Full `import vllm` is deliberately NOT attempted: it requires a GPU
+          # driver; this runner has none. Import verification happens in the
+          # Colab G4 notebook's first serving cell.
+
+      - name: Upload wheel as Actions artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vllm-sm120a-wheel-${{ github.sha }}
+          path: dist/vllm-*.whl
+          retention-days: 30
+
+      - name: Publish GitHub Release (the notebook's install source)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euxo pipefail
+          SHORTSHA="$(git rev-parse --short=9 HEAD)"
+          TAG="sm120a-wheels-${SHORTSHA}${{ inputs.release_tag_suffix || '' }}"
+          WHEEL="$(ls dist/vllm-*.whl)"
+          NOTES="sm_120a (CC 12.0, RTX PRO 6000 Blackwell / Colab G4) vLLM wheel.
+          Source: ${{ github.ref_name }} @ ${{ github.sha }}
+          Toolchain: nvcc 13.0 (apt cuda-toolkit-13-0), torch ${TORCH_VERSION}+cu130, TORCH_CUDA_ARCH_LIST=12.0a, python 3.12.
+          Install (Colab G4): pip install torch==${TORCH_VERSION} --index-url ${TORCH_INDEX_URL} && pip install <this .whl>
+          FlashInfer stays source-tree JIT (jethac/flashinfer @ spark/hijinks-022-fa2-d512) - see campaign docs/COLAB_G4_LANE.md."
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "release ${TAG} exists; uploading asset with --clobber"
+            gh release upload "${TAG}" "${WHEEL}" --clobber
+          else
+            gh release create "${TAG}" "${WHEEL}" \
+              --title "sm120a wheels @ ${SHORTSHA}" \
+              --notes "${NOTES}" \
+              --target "${{ github.sha }}"
+          fi
+          echo "RELEASE_URL=https://github.com/${{ github.repository }}/releases/tag/${TAG}" | tee -a "${GITHUB_STEP_SUMMARY}"
