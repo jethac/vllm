@@ -655,6 +655,48 @@ class NemotronHForCausalLMConfig(VerifyAndUpdateConfig):
             cache_config=vllm_config.cache_config,
             hf_config=vllm_config.model_config.hf_config,
         )
+        cls.maybe_route_nvfp4_kv_to_flashinfer(vllm_config)
+
+    @staticmethod
+    def maybe_route_nvfp4_kv_to_flashinfer(vllm_config: "VllmConfig") -> None:
+        """Route NemotronH attention layers to FlashInfer for NVFP4 KV cache.
+
+        NemotronH is a hybrid Mamba-2 / attention model: only a minority of
+        layers are attention (Nano 6/52, Super 8/88) and they use uniform
+        head_dim=128 global attention -- the symmetric FA2 NVFP4 path (no
+        VO-split, unlike Gemma 4). The Mamba layers carry their own
+        MambaAttentionBackend and are unaffected by this selection.
+
+        Only the FlashInfer FA2 path can read a packed NVFP4 paged cache on
+        consumer/SoC Blackwell (CC 12.x), so when the user requests an nvfp4
+        KV cache and has not pinned a backend, route attention to FLASHINFER.
+        Gated on VLLM_NVFP4_KV_VOSPLIT (the default-on nvfp4-FA2 enable knob)
+        and family(120) so datacenter (sm100) and other configs are untouched.
+        """
+        import vllm.envs as envs
+
+        from vllm.platforms import current_platform
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        cache_config = vllm_config.cache_config
+        if (
+            cache_config is not None
+            and cache_config.cache_dtype == "nvfp4"
+            and envs.VLLM_NVFP4_KV_VOSPLIT
+            and vllm_config.attention_config.backend is None
+            and current_platform.is_device_capability_family(120)
+        ):
+            vllm_config.attention_config.backend = AttentionBackendEnum.FLASHINFER
+            head_dim = getattr(
+                vllm_config.model_config.hf_text_config, "head_dim", None
+            )
+            logger.info(
+                "NemotronH hybrid model with NVFP4 KV cache on CC 12.x: "
+                "routing attention layers (uniform head_dim=%s, global) to "
+                "FLASHINFER FA2 so the packed 4-bit paged cache can be read "
+                "natively. Mamba layers keep their own backend.",
+                head_dim,
+            )
 
 
 class NemotronHNanoVLV2Config(VerifyAndUpdateConfig):
