@@ -1651,6 +1651,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 self.q_data_type = self.kv_cache_dtype
         else:
             self.q_data_type = self.model_config.dtype
+            import os as _os  # K0B-QF16
+            if _os.environ.get("VLLM_NVFP4_KV_QF16") and getattr(
+                    self, "use_fa2_nvfp4_kv", False):
+                self.q_data_type = torch.float16
 
         # Prefer TRTLLM attention for decoding in all cases.
         # This allows us to use AttentionCGSupport.UNIFORM_BATCH mode.
@@ -2301,6 +2305,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             # The q quantization is not supported for non-trtllm attention,
             # fall back to model dtype.
             self.q_data_type = self.model_config.dtype
+            import os as _os  # K0B-QF16
+            if _os.environ.get("VLLM_NVFP4_KV_QF16") and getattr(
+                    self, "use_fa2_nvfp4_kv", False):
+                self.q_data_type = torch.float16
 
         # Step 2: Initialize the output metadata
         # Leave prefill/decode/cascade_wrapper empty, to be populated
@@ -3050,6 +3058,9 @@ class FlashInferImpl(AttentionImpl):
             return output.fill_(0)
 
         # Ensure query dtype matches the expected dtype from attention metadata
+        if (attn_metadata.q_data_type == torch.float16
+                and query.dtype == torch.bfloat16):  # K0B-QF16
+            query = query.to(torch.float16)
         assert attn_metadata.q_data_type == query.dtype, (
             f"Query dtype mismatch: expected {attn_metadata.q_data_type}, "
             f"got {query.dtype}"
