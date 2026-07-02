@@ -39,8 +39,7 @@ name: build-sm120a-wheel
 on:
   push:
     branches:
-      - spark/hijinks-e2-vllm
-      - spark/hijinks-e2-dgv
+      - a4q-v2-build
     paths-ignore:
       - ".github/workflows/build-sm121a-arm64-wheel.yml"
   workflow_dispatch:
@@ -64,12 +63,15 @@ env:
 
 jobs:
   build-wheel:
-    # Ubicloud keeps this CPU-heavy nvcc build off local machines and off the
-    # Spark. The 30-vCPU shape gives enough CPU/RAM/disk for a single-arch
-    # sm_120a wheel while staying within the hosted runner integration.
-    # Colab G4 currently runs Ubuntu 22.04 / glibc 2.35. Build on the same
-    # base so the wheel does not pick up newer glibc symbols from Ubuntu 24.04.
-    runs-on: ubicloud-standard-30-ubuntu-2204
+    # J-8 retarget (2026-07-03): the ubicloud static runner is gone. GitHub
+    # standard hosted runners are the fallback: 4 vCPU / 15 GiB RAM / ~110 GB
+    # free disk (probe run 28607441331). Premium labels (ubuntu-latest-N-cores)
+    # queue forever on this personal account - do not use them. A cold build
+    # will NOT finish in one 6 h job at MAX_JOBS=3: that is what the
+    # ccache-resume design below is for - re-run until the wheel gate passes.
+    # Ubuntu 22.04 / glibc 2.35 base kept so the wheel does not pick up newer
+    # glibc symbols (Colab G4 + Spark r10 are glibc 2.35).
+    runs-on: ubuntu-22.04
     timeout-minutes: 355
     steps:
       - name: Checkout
@@ -133,20 +135,24 @@ jobs:
           TORCH_CUDA_ARCH_LIST: "12.0a"
           VLLM_MAIN_CUDA_VERSION: "13.0"
           VLLM_TARGET_DEVICE: cuda
-          MAX_JOBS: "20" # ubicloud-standard-30: leave memory headroom for nvcc
+          # Hosted runner is 4 vCPU / 15 GiB; heavy cutlass TUs can eat
+          # 4-6 GB each, so 3 parallel nvcc jobs is the OOM-safe ceiling.
+          MAX_JOBS: "3"
           NVCC_THREADS: "1"
-          CMAKE_BUILD_PARALLEL_LEVEL: "20"
+          CMAKE_BUILD_PARALLEL_LEVEL: "3"
           CMAKE_C_COMPILER_LAUNCHER: ccache
           CMAKE_CXX_COMPILER_LAUNCHER: ccache
           CMAKE_CUDA_COMPILER_LAUNCHER: ccache
-          CCACHE_MAXSIZE: 20G
+          # actions/cache rejects entries >10 GB per repo (shared with the
+          # arm64 workflow) - stay under half.
+          CCACHE_MAXSIZE: 4800M
         run: |
           set -euxo pipefail
           export PATH="${CUDA_HOME}/bin:${PATH}"
           SHORTSHA="$(git rev-parse --short=9 HEAD)"
           # Deterministic version => deterministic wheel filename for the
           # notebook's templated release URL.
-          export VLLM_VERSION_OVERRIDE="0.1.dev1+g${SHORTSHA}.sm120a"
+          export VLLM_VERSION_OVERRIDE="0.1.dev1+g${SHORTSHA}.sm120a.a4q"
           export SETUPTOOLS_SCM_PRETEND_VERSION="${VLLM_VERSION_OVERRIDE}"
           ccache --zero-stats || true
           pip wheel --no-build-isolation --no-deps -w dist . -v
@@ -231,9 +237,9 @@ jobs:
         run: |
           set -euxo pipefail
           SHORTSHA="$(git rev-parse --short=9 HEAD)"
-          TAG="sm120a-wheels-${SHORTSHA}${{ inputs.release_tag_suffix || '' }}"
+          TAG="sm120a-wheels-${SHORTSHA}-a4q${{ inputs.release_tag_suffix || '' }}"
           WHEEL="$(ls dist/vllm-*.whl)"
-          NOTES="sm_120a (CC 12.0, RTX PRO 6000 Blackwell / Colab G4) vLLM wheel.
+          NOTES="sm_120a (CC 12.0, RTX PRO 6000 Blackwell / Colab G4) vLLM wheel with A4Q wiring (env-gated, default off: VLLM_NVFP4_A4Q=1 nvf4-QK prefill, VLLM_NVFP4_KV_QF16=1 fp16-Q; needs jethac/flashinfer @ a4q-prototype).
           Source: ${{ github.ref_name }} @ ${{ github.sha }}
           Toolchain: nvcc 13.0 (apt cuda-toolkit-13-0), torch ${TORCH_VERSION}+cu130, TORCH_CUDA_ARCH_LIST=12.0a, python 3.12.
           Install (Colab G4): pip install torch==${TORCH_VERSION} --index-url ${TORCH_INDEX_URL} && pip install <this .whl>

@@ -1,19 +1,18 @@
 # dgx-spark-hijinks campaign: CI sm_121a aarch64 vLLM wheel for Spark-class ARM hosts.
 #
-# This workflow runs on Ubicloud arm64 so no local CPU or Spark window is spent
-# compiling. It is intentionally separate from the x64 sm_120a workflow so both
-# builds can run in parallel. This file has a path-scoped push trigger so a
-# workflow-only touch can launch arm64 without duplicating the x64 build.
+# J-8 retarget (2026-07-03): the ubicloud arm64 static runner is gone; this now
+# runs on GitHub's hosted arm64 runners (ubuntu-22.04-arm: 4 vCPU Cobalt /
+# 15 GiB / ~110 GB disk, free for public repos - probe run 28607441331).
+# It is intentionally separate from the x64 sm_120a workflow so both builds
+# can run in parallel. On the a4q-v2-build branch the push trigger is
+# unfiltered: a branch push launches BOTH wheels.
 
 name: build-sm121a-arm64-wheel
 
 on:
   push:
     branches:
-      - spark/hijinks-e2-vllm
-      - spark/hijinks-e2-dgv
-    paths:
-      - ".github/workflows/build-sm121a-arm64-wheel.yml"
+      - a4q-v2-build
   workflow_dispatch:
     inputs:
       release_tag_suffix:
@@ -38,7 +37,8 @@ env:
 
 jobs:
   build-wheel:
-    runs-on: ubicloud-standard-30-arm-ubuntu-2204
+    # glibc 2.35 ceiling: MUST stay on 22.04 (Spark r10 stack).
+    runs-on: ubuntu-22.04-arm
     timeout-minutes: 355
     steps:
       - name: Checkout
@@ -107,18 +107,22 @@ jobs:
           TORCH_CUDA_ARCH_LIST: "12.1a"
           VLLM_MAIN_CUDA_VERSION: "13.0"
           VLLM_TARGET_DEVICE: cuda
-          MAX_JOBS: "20"
+          # Hosted arm64 runner is 4 vCPU / 15 GiB; 3 parallel nvcc jobs is
+          # the OOM-safe ceiling (heavy cutlass TUs run 4-6 GB each).
+          MAX_JOBS: "3"
           NVCC_THREADS: "1"
-          CMAKE_BUILD_PARALLEL_LEVEL: "20"
+          CMAKE_BUILD_PARALLEL_LEVEL: "3"
           CMAKE_C_COMPILER_LAUNCHER: ccache
           CMAKE_CXX_COMPILER_LAUNCHER: ccache
           CMAKE_CUDA_COMPILER_LAUNCHER: ccache
-          CCACHE_MAXSIZE: 20G
+          # actions/cache rejects entries >10 GB per repo (shared with the
+          # x64 workflow) - stay under half.
+          CCACHE_MAXSIZE: 4800M
         run: |
           set -euxo pipefail
           export PATH="${CUDA_HOME}/bin:${PATH}"
           SHORTSHA="$(git rev-parse --short=9 HEAD)"
-          export VLLM_VERSION_OVERRIDE="0.1.dev1+g${SHORTSHA}.sm121a.arm64"
+          export VLLM_VERSION_OVERRIDE="0.1.dev1+g${SHORTSHA}.sm121a.arm64.a4q"
           export SETUPTOOLS_SCM_PRETEND_VERSION="${VLLM_VERSION_OVERRIDE}"
           ccache --zero-stats || true
           pip wheel --no-build-isolation --no-deps -w dist . -v
@@ -189,9 +193,9 @@ jobs:
         run: |
           set -euxo pipefail
           SHORTSHA="$(git rev-parse --short=9 HEAD)"
-          TAG="sm121a-arm64-wheels-${SHORTSHA}${{ inputs.release_tag_suffix || '' }}"
+          TAG="sm121a-arm64-wheels-${SHORTSHA}-a4q${{ inputs.release_tag_suffix || '' }}"
           WHEEL="$(ls dist/vllm-*.whl)"
-          NOTES="sm_121a (CC 12.1, GB10 / DGX Spark class) arm64 vLLM wheel.
+          NOTES="sm_121a (CC 12.1, GB10 / DGX Spark class) arm64 vLLM wheel with A4Q wiring (env-gated, default off: VLLM_NVFP4_A4Q=1 nvf4-QK prefill, VLLM_NVFP4_KV_QF16=1 fp16-Q; needs jethac/flashinfer @ a4q-prototype).
           Source: ${{ github.ref_name }} @ ${{ github.sha }}
           Toolchain: nvcc 13.0 (SBSA repo, build OS auto), torch ${TORCH_VERSION}+cu130, TORCH_CUDA_ARCH_LIST=12.1a, python 3.12. Built on Ubuntu 22.04 / glibc 2.35 to match the Spark r10 serving stack (torch 2.11) -- loads in r10 with no retrofit; bake r11 = r10 + this wheel."
           if gh release view "${TAG}" >/dev/null 2>&1; then
