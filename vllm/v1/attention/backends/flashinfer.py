@@ -822,6 +822,10 @@ def _flashinfer_dtype_uri_part(dtype: torch.dtype) -> str:
     return str(dtype).replace("torch.", "").replace(".", "_")
 
 
+def _vllm_nvfp4_a4q_enabled() -> bool:  # A4Q-WIRE
+    return os.environ.get("VLLM_NVFP4_A4Q", "0") not in ("", "0")
+
+
 def _fa2_nvfp4_prefill_jit_args(
     *,
     q_data_type: torch.dtype,
@@ -834,6 +838,7 @@ def _fa2_nvfp4_prefill_jit_args(
     use_logits_soft_cap: bool,
     pos_encoding_mode: int = 0,
     use_fp16_qk_reduction: bool = False,
+    use_nvf4_qk: bool = False,  # A4Q-WIRE
 ) -> tuple[list[Any], dict[str, Any]]:
     """Build a FlashInfer FA2 paged-prefill JIT module that declares FP4 KV."""
 
@@ -849,6 +854,7 @@ def _fa2_nvfp4_prefill_jit_args(
         f"swa_{int(use_sliding_window)}_"
         f"logits_cap_{int(use_logits_soft_cap)}_"
         f"fp16_qk_{int(use_fp16_qk_reduction)}"
+        + ("_a4q1" if use_nvf4_qk else "")  # A4Q-WIRE
     )
     jit_args: list[Any] = [
         uri,
@@ -867,7 +873,8 @@ def _fa2_nvfp4_prefill_jit_args(
             "maybe_max_item_len_ptr",
             "maybe_k_cache_sf",
             "maybe_v_cache_sf",
-        ],
+        ]
+        + (["maybe_q_sf"] if use_nvf4_qk else []),  # A4Q-WIRE
         [
             "uint8_t",
             "int32_t",
@@ -877,7 +884,8 @@ def _fa2_nvfp4_prefill_jit_args(
             "uint16_t",
             "uint8_t",
             "uint8_t",
-        ],
+        ]
+        + (["uint8_t"] if use_nvf4_qk else []),  # A4Q-WIRE
         [
             "logits_soft_cap",
             "sm_scale",
@@ -900,6 +908,7 @@ def _fa2_nvfp4_prefill_jit_args(
         "use_logits_soft_cap": use_logits_soft_cap,
         "use_fp16_qk_reduction": use_fp16_qk_reduction,
         "fp8_enabled": False,
+        "use_nvf4_qk": use_nvf4_qk,  # A4Q-WIRE
     }
     return jit_args, jit_kwargs
 
@@ -1655,6 +1664,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             if _os.environ.get("VLLM_NVFP4_KV_QF16") and getattr(
                     self, "use_fa2_nvfp4_kv", False):
                 self.q_data_type = torch.float16
+            if _vllm_nvfp4_a4q_enabled() and getattr(
+                    self, "use_fa2_nvfp4_kv", False):
+                # A4Q-WIRE: precedence over QF16 - q travels as packed
+                # uint8 viewed as the model dtype, not fp16.
+                self.q_data_type = self.model_config.dtype
 
         # Prefer TRTLLM attention for decoding in all cases.
         # This allows us to use AttentionCGSupport.UNIFORM_BATCH mode.
@@ -1682,6 +1696,25 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.vo_split = _vo_split_factor(
             self.head_dim, self.use_fa2_nvfp4_kv
         )
+        # A4Q-WIRE: nvf4 block-scaled QK MMA for prefill (env-gated;
+        # v1 kernel scope: head_dim 128, no VO split, no DCP). Outside
+        # scope the flag self-disables and the current path runs.
+        self.a4q_prefill = (
+            _vllm_nvfp4_a4q_enabled()
+            and self.use_fa2_nvfp4_kv
+            and self.head_dim == 128
+            and self.vo_split == 1
+            and not self.use_dcp
+        )
+        if self.a4q_prefill:
+            logger.info_once(
+                "A4Q: nvf4 block-scaled QK MMA enabled for FA2 NVFP4 prefill."
+            )
+        elif _vllm_nvfp4_a4q_enabled() and self.use_fa2_nvfp4_kv:
+            logger.info_once(
+                "A4Q requested but out of v1 scope (head_dim=%d, vo_split=%d, dcp=%s); using the current fp4 prefill path.",
+                self.head_dim, self.vo_split, self.use_dcp,
+            )
         if self.vo_split > 1:
             # BatchDecodeWithPagedKVCacheWrapper.plan() has no head_dim_vo,
             # so route every request through the VO-split-planned prefill
@@ -1845,7 +1878,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     def set_workspace_buffer(self, workspace_buffer: torch.Tensor):
         self._workspace_buffer = workspace_buffer
 
-    def _make_paged_prefill_wrapper(self) -> BatchPrefillWithPagedKVCacheWrapper:
+    def _make_paged_prefill_wrapper(
+        self, use_a4q: bool | None = None
+    ) -> BatchPrefillWithPagedKVCacheWrapper:
+        if use_a4q is None:  # A4Q-WIRE
+            use_a4q = self.a4q_prefill
         if self.use_fa2_nvfp4_kv:
             backend = "fa2"
             o_dtype = self.model_config.dtype
@@ -1864,6 +1901,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 head_dim_vo=self.head_dim // self.vo_split,
                 use_sliding_window=self.window_left >= 0,
                 use_logits_soft_cap=(self.logits_soft_cap or 0.0) > 0,
+                use_nvf4_qk=use_a4q,  # A4Q-WIRE
             )
         elif self.is_kvcache_nvfp4:
             backend = "trtllm-gen"
@@ -1898,7 +1936,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     def _get_mm_prefill_wrapper(self) -> BatchPrefillWithPagedKVCacheWrapper:
         # Only reachable on the mm-prefix path, which rejects DCP.
         if self._mm_prefill_wrapper is None:
-            self._mm_prefill_wrapper = self._make_paged_prefill_wrapper()
+            # A4Q-WIRE: mm-prefix custom-mask path stays on the current
+            # (non-a4q) prefill kernels.
+            self._mm_prefill_wrapper = self._make_paged_prefill_wrapper(
+                use_a4q=False
+            )
         return self._mm_prefill_wrapper
 
     def _get_decode_wrapper(self, batch_size: int, use_cudagraph: bool = False):
@@ -2205,6 +2247,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 o_data_type=o_dtype,
                 fixed_split_size=self.prefill_fixed_split_size,
                 disable_split_kv=self.disable_split_kv,
+                use_nvf4_qk=(not group_mm) and self.a4q_prefill,  # A4Q-WIRE
             )
             wrapper.vllm_prefill_fixed_split_size = self.prefill_fixed_split_size
             wrapper.vllm_disable_split_kv = self.disable_split_kv
@@ -2309,6 +2352,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             if _os.environ.get("VLLM_NVFP4_KV_QF16") and getattr(
                     self, "use_fa2_nvfp4_kv", False):
                 self.q_data_type = torch.float16
+            if _vllm_nvfp4_a4q_enabled() and getattr(
+                    self, "use_fa2_nvfp4_kv", False):
+                # A4Q-WIRE: precedence over QF16 - q travels as packed
+                # uint8 viewed as the model dtype, not fp16.
+                self.q_data_type = self.model_config.dtype
 
         # Step 2: Initialize the output metadata
         # Leave prefill/decode/cascade_wrapper empty, to be populated
@@ -2599,6 +2647,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                             o_data_type=o_dtype,
                             fixed_split_size=self.prefill_fixed_split_size,
                             disable_split_kv=self.disable_split_kv,
+                            use_nvf4_qk=self.a4q_prefill,  # A4Q-WIRE
                         )
                         prefill_wrapper.vllm_prefill_fixed_split_size = (
                             self.prefill_fixed_split_size
