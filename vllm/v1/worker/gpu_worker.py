@@ -65,7 +65,12 @@ from vllm.tracing import instrument
 from vllm.utils.gc_utils import freeze_gc_heap, maybe_attach_gc_debug_callback
 from vllm.utils.gpu_sync_debug import enable_gpu_sync_check, with_gpu_sync_check
 from vllm.utils.mem_constants import GiB_bytes
-from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
+from vllm.utils.mem_utils import (
+    MemorySnapshot,
+    format_gib,
+    memory_profiling,
+    unified_memory_safe_budget,
+)
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
@@ -373,6 +378,27 @@ class Worker(WorkerBase):
             logger.debug(
                 "worker requested memory: %sGiB", format_gib(self.requested_memory)
             )
+
+            if current_platform.is_integrated_gpu(self.device.index):
+                # Unified memory: the CPU and GPU share one physical pool, so an
+                # over-budget allocation (notably the MoE profile_run transient)
+                # is drawn from OS-owned RAM and hard-wedges the host instead of
+                # raising a recoverable CUDA OOM the way a discrete GPU's
+                # separate VRAM pool does. Cap this process's caching allocator
+                # at the OS-safe budget so the spike fails closed. No-op on
+                # discrete GPUs.
+                safe_budget = unified_memory_safe_budget(init_snapshot)
+                fraction = min(1.0, safe_budget / init_snapshot.total_memory)
+                torch.cuda.set_per_process_memory_fraction(fraction, self.device.index)
+                logger.info(
+                    "Unified memory: capping device allocations at %sGiB "
+                    "(%.1f%% of %sGiB) to prevent a host wedge during "
+                    "profiling; free at startup %sGiB.",
+                    format_gib(safe_budget),
+                    fraction * 100,
+                    format_gib(init_snapshot.total_memory),
+                    format_gib(init_snapshot.free_memory),
+                )
         else:
             raise RuntimeError(f"Not support device type: {self.device_config.device}")
 

@@ -17,7 +17,11 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import largest_power_of_2_divisor
-from vllm.utils.mem_utils import MemorySnapshot, format_gib
+from vllm.utils.mem_utils import (
+    MemorySnapshot,
+    format_gib,
+    unified_memory_safe_budget,
+)
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionMetadataBuilder,
@@ -410,6 +414,16 @@ def request_memory(init_snapshot: MemorySnapshot, cache_config: CacheConfig) -> 
     requested_memory = math.ceil(
         init_snapshot.total_memory * cache_config.gpu_memory_utilization
     )
+
+    if current_platform.is_integrated_gpu(init_snapshot.device_.index):
+        # On unified-memory (UMA) devices `total_memory` is the whole CPU+GPU
+        # pool, so `total * util` budgets the KV cache into OS-owned RAM and can
+        # wedge the host. Cap the budget at the OS-safe envelope derived from
+        # the psutil-based true free memory. The companion allocator ceiling in
+        # GPUWorker.init_device bounds the profiling transient the same way.
+        requested_memory = min(
+            requested_memory, unified_memory_safe_budget(init_snapshot)
+        )
 
     if init_snapshot.free_memory < requested_memory:
         raise ValueError(

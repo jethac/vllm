@@ -50,6 +50,11 @@ def get_cpu_memory() -> int:
 
 _UMA_PRESSURE_THRESHOLD = 0.8
 _UMA_MIN_RELEASE_BYTES = 512 * MiB_bytes
+# Fraction of a unified-memory (UMA) pool kept for the OS when sizing vLLM's
+# startup budget. Mirrors _UMA_PRESSURE_THRESHOLD so the budget keeps peak
+# availability at or above the same floor at which
+# release_device_memory_under_pressure() begins reclaiming.
+_UMA_OS_RESERVE_FRACTION = 1.0 - _UMA_PRESSURE_THRESHOLD
 
 
 def release_device_memory_under_pressure(device: torch.device) -> bool:
@@ -193,6 +198,28 @@ class MemorySnapshot:
             f"timestamp={self.timestamp}, "
             f"auto_measure={self.auto_measure}"
         )
+
+
+def unified_memory_safe_budget(snapshot: MemorySnapshot) -> int:
+    """Maximum device memory (bytes) vLLM may hold on a unified-memory (UMA)
+    device without starving the OS.
+
+    On UMA systems (GB10/DGX Spark, GH200, Jetson) the CPU and GPU share one
+    physical pool, so ``total_memory`` includes OS-owned RAM and cannot all be
+    claimed by the GPU. This returns the psutil-based true free memory (see
+    ``MemorySnapshot.measure``) minus an OS reserve.
+
+    Callers must gate on ``current_platform.is_integrated_gpu``; on discrete
+    GPUs this budget is never consulted.
+
+    Args:
+        snapshot: A memory snapshot for the target device.
+
+    Returns:
+        The OS-safe budget in bytes (always >= 0).
+    """
+    reserve = int(_UMA_OS_RESERVE_FRACTION * snapshot.total_memory)
+    return max(0, snapshot.free_memory - reserve)
 
 
 @dataclass
