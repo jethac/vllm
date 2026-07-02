@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlashInfer."""
 
+import os
 from dataclasses import dataclass
 from functools import partial
 from typing import ClassVar
@@ -808,6 +809,14 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         else:
             self.q_data_type = self.model_config.dtype
 
+        if os.environ.get("VLLM_NVFP4_KV_QF16") and self.use_fa2_nvfp4_kv:
+            # K0B-QF16 (env-gated, default off): the FA2 fp4-KV kernel casts
+            # dequantized K to Q's dtype; with a bf16 q that is
+            # cvt(e2m1->fp16) plus an extra hop to bf16. Running the
+            # attention in fp16 removes the second hop. Output stays model
+            # dtype (o_data_type is passed explicitly everywhere).
+            self.q_data_type = torch.float16
+
         # Prefer TRTLLM attention for decoding in all cases.
         # This allows us to use AttentionCGSupport.UNIFORM_BATCH mode.
         self.use_trtllm_decode_attention = can_use_trtllm
@@ -1431,6 +1440,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             # The q quantization is not supported for non-trtllm attention,
             # fall back to model dtype.
             self.q_data_type = self.model_config.dtype
+            if os.environ.get("VLLM_NVFP4_KV_QF16") and self.use_fa2_nvfp4_kv:
+                # K0B-QF16: keep the env-gated fp16 q on the fa2 fp4-KV path.
+                self.q_data_type = torch.float16
 
         # Step 2: Initialize the output metadata
         # Leave prefill/decode/cascade_wrapper empty, to be populated
@@ -1958,6 +1970,12 @@ class FlashInferImpl(AttentionImpl):
             # Profiling run.
             return output.fill_(0)
 
+        if (
+            attn_metadata.q_data_type == torch.float16
+            and query.dtype == torch.bfloat16
+        ):
+            # K0B-QF16: run the fa2 fp4-KV attention in fp16.
+            query = query.to(torch.float16)
         # Ensure query dtype matches the expected dtype from attention metadata
         assert attn_metadata.q_data_type == query.dtype, (
             f"Query dtype mismatch: expected {attn_metadata.q_data_type}, "
