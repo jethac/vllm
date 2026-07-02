@@ -97,6 +97,14 @@ def _vllm_nvfp4_kv_vosplit_requested() -> bool:
     return bool(envs.VLLM_NVFP4_KV_VOSPLIT)
 
 
+def _vllm_nvfp4_a4q_enabled() -> bool:
+    """A4Q (env-gated, default off): nvf4 block-scaled QK MMA for the
+    fa2-nvfp4 KV PREFILL path. Requires a FlashInfer build with
+    use_nvf4_qk / nvfp4_quantize_q_cuda support (jethac/flashinfer
+    a4q-prototype)."""
+    return os.environ.get("VLLM_NVFP4_A4Q", "0") not in ("", "0")
+
+
 def _vo_split_factor(head_size: int, is_fa2_nvfp4: bool) -> int:
     """Number of VO passes for the FlashInfer FA2 path.
 
@@ -816,6 +824,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             # attention in fp16 removes the second hop. Output stays model
             # dtype (o_data_type is passed explicitly everywhere).
             self.q_data_type = torch.float16
+        if _vllm_nvfp4_a4q_enabled() and self.use_fa2_nvfp4_kv:
+            # A4Q-WIRE: precedence over QF16 - q travels as packed uint8
+            # viewed as the model dtype, not fp16.
+            self.q_data_type = self.model_config.dtype
 
         # Prefer TRTLLM attention for decoding in all cases.
         # This allows us to use AttentionCGSupport.UNIFORM_BATCH mode.
@@ -839,6 +851,29 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 self.head_dim,
                 self.vo_split,
                 self.head_dim // self.vo_split,
+            )
+
+        # A4Q-WIRE: nvf4 block-scaled QK MMA for prefill (env-gated; v1
+        # kernel scope: head_dim 128, no VO split, no DCP). Outside scope
+        # the flag self-disables and the current fp4 path runs.
+        self.a4q_prefill = (
+            _vllm_nvfp4_a4q_enabled()
+            and self.use_fa2_nvfp4_kv
+            and self.head_dim == 128
+            and self.vo_split == 1
+            and not self.use_dcp
+        )
+        if self.a4q_prefill:
+            logger.info_once(
+                "A4Q: nvf4 block-scaled QK MMA enabled for FA2 NVFP4 prefill."
+            )
+        elif _vllm_nvfp4_a4q_enabled() and self.use_fa2_nvfp4_kv:
+            logger.info_once(
+                "A4Q requested but out of v1 scope (head_dim=%d, vo_split=%d, "
+                "dcp=%s); using the current fp4 prefill path.",
+                self.head_dim,
+                self.vo_split,
+                self.use_dcp,
             )
 
         self._cascade_wrapper = None  # Wrapper for cascade attention
@@ -1320,6 +1355,15 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 o_data_type=o_dtype,
                 fixed_split_size=self.prefill_fixed_split_size,
                 disable_split_kv=self.disable_split_kv,
+                # A4Q-WIRE: only the plain-causal group runs the nvf4-QK
+                # modules; mm custom-mask groups stay on the current path.
+                # The kwarg is only passed when active so a stock FlashInfer
+                # (no use_nvf4_qk support) works with the gate off.
+                **(
+                    {"use_nvf4_qk": True}
+                    if (not group_mm) and self.a4q_prefill
+                    else {}
+                ),
             )
             wrapper.vllm_prefill_fixed_split_size = self.prefill_fixed_split_size
             wrapper.vllm_disable_split_kv = self.disable_split_kv
@@ -1443,6 +1487,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             if os.environ.get("VLLM_NVFP4_KV_QF16") and self.use_fa2_nvfp4_kv:
                 # K0B-QF16: keep the env-gated fp16 q on the fa2 fp4-KV path.
                 self.q_data_type = torch.float16
+            if _vllm_nvfp4_a4q_enabled() and self.use_fa2_nvfp4_kv:
+                # A4Q-WIRE: precedence over QF16 (q stays model dtype).
+                self.q_data_type = self.model_config.dtype
 
         # Step 2: Initialize the output metadata
         # Leave prefill/decode/cascade_wrapper empty, to be populated
@@ -1694,6 +1741,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                             o_data_type=o_dtype,
                             fixed_split_size=self.prefill_fixed_split_size,
                             disable_split_kv=self.disable_split_kv,
+                            # A4Q-WIRE: nvf4-QK prefill modules; the fork
+                            # wrapper auto-quantizes the bf16 q at run().
+                            # Kwarg only passed when active so a stock
+                            # FlashInfer works with the gate off.
+                            **({"use_nvf4_qk": True} if self.a4q_prefill else {}),
                         )
                 attn_metadata.prefill = FIPrefill(
                     wrapper=prefill_wrapper, mm_groups=mm_groups
