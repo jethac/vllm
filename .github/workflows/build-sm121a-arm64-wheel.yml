@@ -82,6 +82,16 @@ jobs:
           sudo apt-get -qq install -y cuda-toolkit-13-0 ccache
           ${CUDA_HOME}/bin/nvcc --version
 
+      - name: Add 16 GiB swap (cicc memory spikes OOM-killed the runner agent on run 28609643059; swap absorbs them so ccache always gets saved)
+        run: |
+          set -euxo pipefail
+          free -h
+          sudo fallocate -l 16G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
       - name: Restore ccache
         uses: actions/cache/restore@v4
         with:
