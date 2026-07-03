@@ -66,6 +66,16 @@ jobs:
           sudo docker image prune --all --force || true
           df -h /
 
+      - name: Add 16 GiB swap (cicc RAM spikes OOM-killed the runner agent on run 28665869078; swap absorbs them so the runner survives and ccache is always saved -> re-runs resume)
+        run: |
+          set -euxo pipefail
+          # hosted runners pre-provision /swapfile (3 GiB) -> use /swapfile2
+          sudo fallocate -l 16G /swapfile2
+          sudo chmod 600 /swapfile2
+          sudo mkswap /swapfile2
+          sudo swapon /swapfile2
+          free -h
+
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
@@ -121,7 +131,7 @@ jobs:
         run: |
           set -euxo pipefail
           export PATH="${CUDA_HOME}/bin:${PATH}"
-          SHORTSHA="$(git rev-parse --short=9 HEAD)"
+          SHORTSHA="884e01b4f"  # pinned: CI-only branch = 884e01b4f + swap/CI edits; wheel content == 884e01b4f
           export VLLM_VERSION_OVERRIDE="0.1.dev1+g${SHORTSHA}.sm121a.arm64.a4q"
           export SETUPTOOLS_SCM_PRETEND_VERSION="${VLLM_VERSION_OVERRIDE}"
           ccache --zero-stats || true
@@ -192,7 +202,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euxo pipefail
-          SHORTSHA="$(git rev-parse --short=9 HEAD)"
+          SHORTSHA="884e01b4f"  # pinned: CI-only branch = 884e01b4f + swap/CI edits; wheel content == 884e01b4f
           TAG="sm121a-arm64-wheels-${SHORTSHA}-a4q${{ inputs.release_tag_suffix || '' }}"
           WHEEL="$(ls dist/vllm-*.whl)"
           NOTES="sm_121a (CC 12.1, GB10 / DGX Spark class) arm64 vLLM wheel with A4Q wiring (env-gated, default off: VLLM_NVFP4_A4Q=1 nvf4-QK prefill, VLLM_NVFP4_KV_QF16=1 fp16-Q; needs jethac/flashinfer @ a4q-prototype).
@@ -204,6 +214,7 @@ jobs:
             gh release create "${TAG}" "${WHEEL}" \
               --title "sm121a arm64 wheels @ ${SHORTSHA}" \
               --notes "${NOTES}" \
-              --target "${{ github.sha }}"
+              --prerelease \
+              --target "884e01b4f2510b3f805d1f39920537d0d7b81c38"
           fi
           echo "RELEASE_URL=https://github.com/${{ github.repository }}/releases/tag/${TAG}" | tee -a "${GITHUB_STEP_SUMMARY}"
