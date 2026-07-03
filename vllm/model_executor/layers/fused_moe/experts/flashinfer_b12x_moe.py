@@ -158,7 +158,9 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_activation(activation: MoEActivation) -> bool:
-        return activation == MoEActivation.SILU
+        # b12x W4A16 gated epilogue supports silu and gelu_tanh (finishes
+        # flashinfer#3683 for nvfp4-weight Gemma-4 MoE).
+        return activation in (MoEActivation.SILU, MoEActivation.GELU_TANH)
 
     @staticmethod
     def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
@@ -241,6 +243,7 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             num_experts=global_num_experts,
             top_k=top_k,
             num_local_experts=self.num_local_experts,
+            activation=activation.value,
             output_dtype=self.out_dtype,
             output=output,
         )
