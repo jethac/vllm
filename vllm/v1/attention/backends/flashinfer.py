@@ -1702,9 +1702,20 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.a4q_prefill = (
             _vllm_nvfp4_a4q_enabled()
             and self.use_fa2_nvfp4_kv
-            and self.head_dim == 128
-            and self.vo_split == 1
+            and self.head_dim in (128, 256, 512)  # A4Q-WIRE-V2
+            and (
+                self.vo_split == 1
+                or (self.head_dim == 512 and self.vo_split == 2)
+            )
             and not self.use_dcp
+        )
+        # A4Q-WIRE-V2 (J-3): decode wrapper (tensor-core fa2 route)
+        # supports symmetric head_dim {128, 256}; VO-split geometries
+        # route decodes through the prefill wrapper already.
+        self.a4q_decode = (
+            self.a4q_prefill
+            and self.head_dim in (128, 256)
+            and self.vo_split == 1
         )
         if self.a4q_prefill:
             logger.info_once(
@@ -2720,6 +2731,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     o_data_type=o_dtype,
                     fixed_split_size=self.decode_fixed_split_size,
                     disable_split_kv=self.disable_split_kv,
+                    use_nvf4_qk=self.a4q_decode,  # A4Q-WIRE-V2
                 )
                 attn_metadata.decode = FIDecode(wrapper=decode_wrapper)
         return attn_metadata
@@ -4055,6 +4067,7 @@ def fast_plan_decode(
     non_blocking: bool = True,
     fixed_split_size: int = -1,
     disable_split_kv: bool = False,
+    use_nvf4_qk: bool = False,  # A4Q-WIRE-V2
 ) -> None:
     """
     A faster version of BatchDecodeWithPagedKVCacheWrapper::plan used for
@@ -4096,6 +4109,7 @@ def fast_plan_decode(
             seq_lens=None,
             fixed_split_size=fixed_split_size,
             disable_split_kv=disable_split_kv,
+            use_nvf4_qk=use_nvf4_qk,  # A4Q-WIRE-V2
         )
         self.vllm_first_call = False
         return
