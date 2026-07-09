@@ -967,6 +967,35 @@ def _pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
     return page_size * group_size
 
 
+def _nvfp4_fa2_layout_breaks_block_contiguity(vllm_config: VllmConfig) -> bool:
+    """Whether the attention KV layout makes logical blocks non-contiguous.
+
+    On sm120/sm121 the NVFP4 KV cache is served by the FlashInfer FA2 paged
+    reader, which requires each layer's pages to be laid out as one contiguous
+    FP4-data region followed by one contiguous FP8-scale region (see
+    ``nvfp4_kv_cache_split_views`` global split and the matching arch check in
+    ``reshape_and_cache_nvfp4_dispatch``). With that layout a logical block b
+    no longer owns the contiguous byte range ``[b * page_size, (b + 1) *
+    page_size)`` of its tensor — block b's data and scales live in two
+    disjoint regions whose offsets are not multiples of ``page_size``.
+
+    Cross-group tensor sharing (attention + Mamba/GDN layers sharing one
+    KVCacheTensor) relies exactly on that byte-contiguity invariant: each
+    group addresses the shared buffer as ``block_id * page_size``. Sharing a
+    globally-split attention tensor therefore lets e.g. GDN state writes
+    overlap attention KV data. Observed on a hybrid Qwen model as
+    deterministic corruption of every second request (whether a request's
+    attention blocks fall inside the GDN state range depends solely on the
+    allocator's alternating block handout).
+    """
+    if vllm_config.cache_config.cache_dtype != "nvfp4":
+        return False
+    from vllm.platforms import current_platform
+
+    capability = current_platform.get_device_capability()
+    return capability is not None and capability.major >= 12
+
+
 def get_num_blocks(
     vllm_config: VllmConfig,
     num_layers: int,
@@ -1369,18 +1398,62 @@ def get_kv_cache_config_from_groups(
             [group.kv_cache_spec for group in kv_cache_groups]
         )
         assert group_size > 0, "group_size must be greater than 0"
-        num_blocks = get_num_blocks(
-            vllm_config, group_size, available_memory, page_size
-        )
-        kv_cache_tensors = []
-        for i in range(group_size):
-            shared_by = []
-            for j in range(len(kv_cache_groups)):
-                if i < len(kv_cache_groups[j].layer_names):
-                    shared_by.append(kv_cache_groups[j].layer_names[i])
-            kv_cache_tensors.append(
-                KVCacheTensor(size=page_size * num_blocks, shared_by=shared_by)
+
+        spec_types = {type(group.kv_cache_spec) for group in kv_cache_groups}
+        if len(spec_types) > 1 and _nvfp4_fa2_layout_breaks_block_contiguity(
+            vllm_config
+        ):
+            # The FA2 NVFP4 global [all-data | all-scales] layout makes
+            # attention blocks non-contiguous in bytes, so tensors must not
+            # be shared across groups of different spec types (see
+            # _nvfp4_fa2_layout_breaks_block_contiguity). Pair layers only
+            # within groups of the same spec type: e.g. the Mamba/GDN groups
+            # keep sharing among themselves (identical, block-contiguous
+            # mapping), while attention layers get exclusive tensors.
+            buckets: dict[type, list[KVCacheGroupSpec]] = {}
+            for group in kv_cache_groups:
+                buckets.setdefault(type(group.kv_cache_spec), []).append(group)
+            slots: list[list[str]] = []
+            for bucket in buckets.values():
+                bucket_size = max(len(group.layer_names) for group in bucket)
+                for i in range(bucket_size):
+                    slots.append(
+                        [
+                            group.layer_names[i]
+                            for group in bucket
+                            if i < len(group.layer_names)
+                        ]
+                    )
+            num_blocks = get_num_blocks(
+                vllm_config, len(slots), available_memory, page_size
             )
+            kv_cache_tensors = [
+                KVCacheTensor(size=page_size * num_blocks, shared_by=shared_by)
+                for shared_by in slots
+            ]
+            logger.warning(
+                "NVFP4 KV cache with the FlashInfer FA2 layout on a hybrid "
+                "model: disabling KV cache tensor sharing across layer "
+                "groups of different types to avoid corruption (%d instead "
+                "of %d memory pools, i.e. proportionally fewer KV blocks). "
+                "A block-contiguous NVFP4 page layout would restore full "
+                "sharing.",
+                len(slots),
+                group_size,
+            )
+        else:
+            num_blocks = get_num_blocks(
+                vllm_config, group_size, available_memory, page_size
+            )
+            kv_cache_tensors = []
+            for i in range(group_size):
+                shared_by = []
+                for j in range(len(kv_cache_groups)):
+                    if i < len(kv_cache_groups[j].layer_names):
+                        shared_by.append(kv_cache_groups[j].layer_names[i])
+                kv_cache_tensors.append(
+                    KVCacheTensor(size=page_size * num_blocks, shared_by=shared_by)
+                )
 
     return KVCacheConfig(
         num_blocks=num_blocks,
