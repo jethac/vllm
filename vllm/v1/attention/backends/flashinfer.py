@@ -48,6 +48,7 @@ from vllm.utils.torch_utils import (
     is_strictly_contiguous,
     nvfp4_kv_cache_full_dim,
     nvfp4_kv_cache_split_views,
+    nvfp4_kv_global_split_enabled,
 )
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -2072,8 +2073,15 @@ class FlashInferImpl(AttentionImpl):
         nvfp4_kv_data = None
         nvfp4_kv_block_scales = None
         if self.is_kvcache_nvfp4:
+            # Per-page [data | scale] split by default (block-byte-contiguous,
+            # safe for hybrid-model tensor sharing); the FA2 reader consumes
+            # the SF views via their explicit strides. The global split is a
+            # debug escape hatch (VLLM_NVFP4_KV_GLOBAL_SPLIT=1) and must match
+            # the writer dispatch.
             nvfp4_kv_data, nvfp4_kv_block_scales = nvfp4_kv_cache_split_views(
-                kv_cache_permute, contiguous_sf_layout=self.use_fa2_nvfp4_kv
+                kv_cache_permute,
+                contiguous_sf_layout=self.use_fa2_nvfp4_kv
+                and nvfp4_kv_global_split_enabled(),
             )
 
         use_dcp = self.dcp_world_size > 1

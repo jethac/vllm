@@ -17,6 +17,8 @@
 #define NVFP4_ENABLE_ELTS16 1
 #include "libtorch_stable/quantization/fp4/nvfp4_utils.cuh"
 
+#include <cstdlib>
+
 #include "libtorch_stable/dispatch_utils.h"
 #include "libtorch_stable/torch_utils.h"
 
@@ -212,13 +214,24 @@ void reshape_and_cache_nvfp4_dispatch(torch::stable::Tensor& key,
   STD_TORCH_CHECK(head_size % 16 == 0,
                   "head_size must be divisible by 16 for NVFP4 KV cache");
 
-  // SM120/SM121 (consumer Blackwell) serve NVFP4 KV via the FlashInfer FA2
-  // paged reader, which derives the scale-factor stride as data_stride/8 and
-  // reads V scales linearly. That requires a contiguous [all-data | all-SF]
-  // page layout (NHD), not the SM100 trtllm-gen per-page [data|scale]
-  // interleave with the 4-token V swizzle. Select the layout by arch.
-  const bool contiguous_layout = get_device_prop()->major >= 12;
-  const bool swizzle_v_sf = !contiguous_layout;
+  // Per-page [K_data | K_scale | V_data | V_scale] is the default layout on
+  // all archs: it keeps every logical KV block byte-contiguous within its
+  // page, which vLLM's hybrid-model KV tensor sharing relies on (a global
+  // [all-data | all-SF] split lets e.g. Mamba/GDN state writes overlap
+  // attention KV data). The FlashInfer FA2 paged nvfp4 reader on
+  // SM120/SM121 consumes the per-page layout via explicit SF strides taken
+  // from the SF tensor (linear V scales, no swizzle); the SM100 trtllm-gen
+  // reader keeps its 4-token V scale swizzle.
+  // VLLM_NVFP4_KV_GLOBAL_SPLIT=1 restores the previous global split on
+  // sm12x as a debug escape hatch (must match the Python-side view split in
+  // nvfp4_kv_cache_split_views).
+  static const bool use_global_split = [] {
+    const char* env = std::getenv("VLLM_NVFP4_KV_GLOBAL_SPLIT");
+    return env != nullptr && env[0] == '1';
+  }();
+  const bool contiguous_layout =
+      use_global_split && get_device_prop()->major >= 12;
+  const bool swizzle_v_sf = get_device_prop()->major < 12;
 
   STD_TORCH_CHECK(!swizzle_v_sf || block_size % 4 == 0,
                   "block_size must be divisible by 4 for NVFP4 KV cache V "

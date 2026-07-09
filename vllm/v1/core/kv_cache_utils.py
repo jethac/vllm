@@ -990,6 +990,12 @@ def _nvfp4_fa2_layout_breaks_block_contiguity(vllm_config: VllmConfig) -> bool:
     """
     if vllm_config.cache_config.cache_dtype != "nvfp4":
         return False
+    from vllm.utils.torch_utils import nvfp4_kv_global_split_enabled
+
+    if not nvfp4_kv_global_split_enabled():
+        # Default per-page [data | scale] layout: every logical block owns a
+        # contiguous byte range, so cross-group sharing stays safe.
+        return False
     from vllm.platforms import current_platform
 
     capability = current_platform.get_device_capability()

@@ -467,6 +467,17 @@ def _nvfp4_split_data_scale(
     return data, scale
 
 
+def nvfp4_kv_global_split_enabled() -> bool:
+    """Debug escape hatch: restore the global [all-data | all-SF] NVFP4 KV
+    layout on sm12x (VLLM_NVFP4_KV_GLOBAL_SPLIT=1).
+
+    The per-page [data | scale] layout is the default because it keeps every
+    logical KV block byte-contiguous, which the hybrid-model KV tensor
+    sharing relies on. Must match the layout choice in the C++ writer
+    dispatch (reshape_and_cache_nvfp4_dispatch)."""
+    return os.environ.get("VLLM_NVFP4_KV_GLOBAL_SPLIT") == "1"
+
+
 def _nvfp4_global_split_views(kv_cache: torch.Tensor) -> tuple[tuple, tuple]:
     """Contiguous [all-data | all-SF] split for the FlashInfer FA2 nvfp4 path.
 
