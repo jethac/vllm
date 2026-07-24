@@ -2,13 +2,22 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
 from collections.abc import Iterable, Mapping, Sequence
-from typing import Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 import torch
 from torch import nn
 from transformers import BatchFeature, Gemma3Config, Gemma3Processor
-from transformers.models.gemma3.image_processing_gemma3 import Gemma3ImageProcessor
-from transformers.models.gemma3.processing_gemma3 import Gemma3ProcessorKwargs
+
+if TYPE_CHECKING:
+    # ``Gemma3ImageProcessor`` pulls in torchvision, and both submodules are
+    # version-gated. Importing them lazily (here for typing, inside the methods
+    # below for runtime use) keeps this module importable -- so architecture
+    # inspection and unrelated models are not broken -- when torchvision or a
+    # matching transformers is absent. The dependency only surfaces if you
+    # actually process Gemma 3 image inputs.
+    from transformers.models.gemma3.image_processing_gemma3 import (
+        Gemma3ImageProcessor,
+    )
 
 from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
@@ -94,6 +103,10 @@ class Gemma3ProcessingInfo(BaseProcessingInfo):
         processor: Gemma3Processor,
         mm_kwargs: Mapping[str, object],
     ) -> int:
+        from transformers.models.gemma3.processing_gemma3 import (
+            Gemma3ProcessorKwargs,
+        )
+
         image_processor: Gemma3ImageProcessor = processor.image_processor
 
         images_kwargs = processor._merge_kwargs(
@@ -211,6 +224,10 @@ class Gemma3ProcessingInfo(BaseProcessingInfo):
         return (num_crops + 1) * image_seq_len
 
     def get_image_size_with_most_features(self) -> ImageSize:
+        from transformers.models.gemma3.processing_gemma3 import (
+            Gemma3ProcessorKwargs,
+        )
+
         processor = self.get_hf_processor()
         image_processor: Gemma3ImageProcessor = processor.image_processor
 

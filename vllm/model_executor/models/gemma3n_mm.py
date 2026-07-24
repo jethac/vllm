@@ -1,20 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable, Mapping, Sequence
-from typing import Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 import torch
 from torch import nn
 from transformers import AutoModel, BatchFeature
-from transformers.models.gemma3n import (
-    Gemma3nAudioConfig,
-    Gemma3nAudioFeatureExtractor,
-    Gemma3nConfig,
-    Gemma3nProcessor,
-    Gemma3nTextConfig,
-    Gemma3nVisionConfig,
-)
-from transformers.models.siglip import SiglipImageProcessorFast
+
+if TYPE_CHECKING:
+    # ``transformers.models.gemma3n`` is version-gated and ``siglip``'s fast
+    # image processor pulls in torchvision. Importing lazily (here for typing,
+    # inside the methods below for runtime use) keeps this module importable --
+    # so architecture inspection and unrelated models are not broken -- when
+    # those dependencies are absent; they only surface when a Gemma 3n model is
+    # actually loaded.
+    from transformers.models.gemma3n import (
+        Gemma3nAudioConfig,
+        Gemma3nAudioFeatureExtractor,
+        Gemma3nProcessor,
+        Gemma3nTextConfig,
+        Gemma3nVisionConfig,
+    )
+    from transformers.models.siglip import SiglipImageProcessorFast
 
 from vllm.config import ModelConfig, SpeechToTextConfig, VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
@@ -101,12 +108,16 @@ Gemma3nImageInputs = Gemma3nImagePixelInputs
 
 class Gemma3nProcessingInfo(BaseProcessingInfo):
     def get_hf_config(self):
+        from transformers.models.gemma3n import Gemma3nConfig
+
         return self.ctx.get_hf_config(Gemma3nConfig)
 
     def get_hf_processor(self, **kwargs: object):
+        from transformers.models.gemma3n import Gemma3nProcessor
+
         return self.ctx.get_hf_processor(Gemma3nProcessor, **kwargs)
 
-    def get_feature_extractor(self, **kwargs: object) -> Gemma3nAudioFeatureExtractor:
+    def get_feature_extractor(self, **kwargs: object) -> "Gemma3nAudioFeatureExtractor":
         return self.get_hf_processor(**kwargs).feature_extractor
 
     def get_data_parser(self):
@@ -130,7 +141,7 @@ class Gemma3nProcessingInfo(BaseProcessingInfo):
         *,
         image_width: int,
         image_height: int,
-        processor: Gemma3nProcessor,
+        processor: "Gemma3nProcessor",
     ) -> str:
         """
         Get the replacement text for image tokens.
@@ -145,7 +156,7 @@ class Gemma3nProcessingInfo(BaseProcessingInfo):
     def get_audio_repl(
         self,
         *,
-        processor: Gemma3nProcessor,
+        processor: "Gemma3nProcessor",
     ) -> str:
         """
         Get the replacement text for audio tokens.
@@ -391,8 +402,8 @@ class Gemma3nMultimodalEmbedder(nn.Module):
 
     def __init__(
         self,
-        multimodal_config: Gemma3nAudioConfig | Gemma3nVisionConfig,
-        text_config: Gemma3nTextConfig,
+        multimodal_config: "Gemma3nAudioConfig | Gemma3nVisionConfig",
+        text_config: "Gemma3nTextConfig",
     ):
         super().__init__()
 

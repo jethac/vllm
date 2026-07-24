@@ -23,15 +23,6 @@ import torch
 from PIL import Image as PILImage
 from torch import nn
 from transformers import AutoModel, BatchFeature
-from transformers.models.gemma4 import (
-    Gemma4Config,
-    Gemma4Processor,
-    Gemma4VisionConfig,
-)
-from transformers.models.gemma4.configuration_gemma4 import (
-    Gemma4AudioConfig,
-    Gemma4TextConfig,
-)
 
 from vllm.config import VllmConfig
 from vllm.config.model import get_served_model_name
@@ -86,6 +77,21 @@ from .utils import (
 )
 
 if TYPE_CHECKING:
+    # These live in ``transformers.models.gemma4``, which only exists in
+    # transformers versions new enough to ship Gemma 4. Importing them lazily
+    # (here for typing, and inside the methods below for runtime use) keeps
+    # this module importable -- so architecture inspection and unrelated
+    # models are not broken -- on older transformers. The missing dependency
+    # only surfaces if you actually load a Gemma 4 multimodal model.
+    from transformers.models.gemma4 import (
+        Gemma4Processor,
+        Gemma4VisionConfig,
+    )
+    from transformers.models.gemma4.configuration_gemma4 import (
+        Gemma4AudioConfig,
+        Gemma4TextConfig,
+    )
+
     from vllm.model_executor.layers.quantization import QuantizationConfig
     from vllm.v1.worker.encoder_cudagraph_defs import (
         EncoderCudaGraphCaptureInputs,
@@ -194,6 +200,8 @@ class Gemma4VideoInputs(TensorSchema):
 
 class Gemma4ProcessingInfo(BaseProcessingInfo):
     def get_hf_config(self):
+        from transformers.models.gemma4 import Gemma4Config
+
         return self.ctx.get_hf_config(Gemma4Config)
 
     def get_default_tok_params(self):
@@ -215,7 +223,9 @@ class Gemma4ProcessingInfo(BaseProcessingInfo):
             params = params.with_kwargs(add_special_tokens=False)
         return params
 
-    def get_hf_processor(self, **kwargs: object) -> Gemma4Processor:
+    def get_hf_processor(self, **kwargs: object) -> "Gemma4Processor":
+        from transformers.models.gemma4 import Gemma4Processor
+
         return self.ctx.get_hf_processor(
             Gemma4Processor,
             **kwargs,
@@ -326,7 +336,7 @@ class Gemma4ProcessingInfo(BaseProcessingInfo):
         *,
         image_width: int,
         image_height: int,
-        processor: Gemma4Processor | None,
+        processor: "Gemma4Processor | None",
         max_soft_tokens: int | None = None,
     ) -> PromptUpdateDetails[list[int]]:
         """Return the dynamic image token sequence for this image.
@@ -381,7 +391,7 @@ class Gemma4ProcessingInfo(BaseProcessingInfo):
         self,
         *,
         audio_len: int,
-        processor: Gemma4Processor | None,
+        processor: "Gemma4Processor | None",
     ) -> PromptUpdateDetails[list[int]]:
         """Return the dynamic audio token sequence for this audio.
 
@@ -409,7 +419,7 @@ class Gemma4ProcessingInfo(BaseProcessingInfo):
         *,
         timestamps: list[float],
         num_soft_tokens_per_frame: list[int],
-        processor: Gemma4Processor,
+        processor: "Gemma4Processor",
     ) -> PromptUpdateDetails[list[int]]:
         """Build the full token replacement for one video.
 
@@ -931,8 +941,8 @@ class Gemma4MultimodalEmbedder(nn.Module):
 
     def __init__(
         self,
-        multimodal_config: Gemma4VisionConfig | Gemma4AudioConfig,
-        text_config: Gemma4TextConfig,
+        multimodal_config: "Gemma4VisionConfig | Gemma4AudioConfig",
+        text_config: "Gemma4TextConfig",
         *,
         quant_config: "QuantizationConfig | None" = None,
         prefix: str = "",

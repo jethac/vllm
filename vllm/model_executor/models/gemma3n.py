@@ -16,10 +16,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from collections.abc import Iterable
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
-from transformers.models.gemma3n.configuration_gemma3n import Gemma3nTextConfig
+
+if TYPE_CHECKING:
+    # ``transformers.models.gemma3n`` is version-gated. Importing lazily (here
+    # for typing, inside the method below for the runtime isinstance) keeps this
+    # module importable -- so architecture inspection and the modules that
+    # import it (e.g. gemma3n_mm) are not broken -- on older transformers.
+    from transformers.models.gemma3n.configuration_gemma3n import Gemma3nTextConfig
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
@@ -274,7 +281,7 @@ class Gemma3nMLP(nn.Module):
 class Gemma3nAttention(nn.Module):
     def __init__(
         self,
-        config: Gemma3nTextConfig,
+        config: "Gemma3nTextConfig",
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
@@ -426,12 +433,16 @@ class Gemma3nAttention(nn.Module):
 class Gemma3nDecoderLayer(nn.Module):
     def __init__(
         self,
-        config: Gemma3nTextConfig,
+        config: "Gemma3nTextConfig",
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
+        from transformers.models.gemma3n.configuration_gemma3n import (
+            Gemma3nTextConfig,
+        )
+
         assert isinstance(config, Gemma3nTextConfig)
         self.altup_active_idx = config.altup_active_idx
         assert config.altup_correct_scale
