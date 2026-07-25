@@ -196,6 +196,8 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_NVFP4_KV_LINEAR_V_SF: bool = False
     VLLM_NVFP4_KV_VOSPLIT: bool = False
+    VLLM_NVFP4_KV_QF16: bool = False
+    VLLM_NVFP4_A4Q: bool = False
     VLLM_FLASHINFER_VOSPLIT: bool = False
     VLLM_FLASHINFER_BF16_GEMMA: bool = True
     VLLM_FLASHINFER_MM_PREFIX: bool = True
@@ -1632,6 +1634,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # two-pass VO split (Gemma 4 global D=512 layers). Requires
     # VLLM_NVFP4_KV_LINEAR_V_SF=1.
     "VLLM_NVFP4_KV_VOSPLIT": lambda: os.getenv("VLLM_NVFP4_KV_VOSPLIT", "")
+    not in ("", "0"),
+    # NVFP4 KV cache: keep the attention query in f16 (bf16/fp16) rather than
+    # casting it to the fp8 the KV path uses. Same NVFP4 KV bytes; f16-Q is the
+    # recommended fidelity default. The backend reads this via os.environ; this
+    # registration only makes the var known (silences the spurious "Unknown
+    # vLLM environment variable" warning). Read semantics: not in ("","0").
+    "VLLM_NVFP4_KV_QF16": lambda: os.getenv("VLLM_NVFP4_KV_QF16", "")
+    not in ("", "0"),
+    # A4Q (opt-in perf, default off): nvf4 block-scaled QK MMA for the FA2
+    # nvfp4-KV prefill path. Requires a FlashInfer build with use_nvf4_qk.
+    # The backend reads this via os.environ; this registration only makes the
+    # var known (silences the "Unknown vLLM environment variable" warning).
+    "VLLM_NVFP4_A4Q": lambda: os.getenv("VLLM_NVFP4_A4Q", "")
     not in ("", "0"),
     # Extend the FA2 two-pass VO split to ALL KV dtypes (bf16/fp16/fp8)
     # and serve Gemma 4 entirely on FlashInfer instead of the model-wide
