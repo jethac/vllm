@@ -159,7 +159,7 @@ jobs:
         run: |
           set -euxo pipefail
           export PATH="${CUDA_HOME}/bin:${PATH}"
-          SHORTSHA="884e01b4f"  # pinned: CI-only branch = 884e01b4f + swap/CI edits; wheel content == 884e01b4f
+          SHORTSHA="$(git rev-parse --short=9 HEAD)"  # r3 per-page head (932b6118) — label matches source
           # Deterministic version => deterministic wheel filename for the
           # notebook's templated release URL.
           export VLLM_VERSION_OVERRIDE="0.1.dev1+g${SHORTSHA}.sm120a.a4q.dg.r3"
