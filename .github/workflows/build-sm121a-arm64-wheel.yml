@@ -131,8 +131,8 @@ jobs:
         run: |
           set -euxo pipefail
           export PATH="${CUDA_HOME}/bin:${PATH}"
-          SHORTSHA="884e01b4f"  # pinned: CI-only branch = 884e01b4f + swap/CI edits; wheel content == 884e01b4f
-          export VLLM_VERSION_OVERRIDE="0.1.dev1+g${SHORTSHA}.sm121a.arm64.a4q"
+          SHORTSHA="$(git rev-parse --short=9 HEAD)"  # r3 per-page head (17cbdea86)
+          export VLLM_VERSION_OVERRIDE="0.1.dev1+g${SHORTSHA}.sm121a.arm64.a4q.dg.r3"
           export SETUPTOOLS_SCM_PRETEND_VERSION="${VLLM_VERSION_OVERRIDE}"
           ccache --zero-stats || true
           pip wheel --no-build-isolation --no-deps -w dist . -v
@@ -202,19 +202,19 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euxo pipefail
-          SHORTSHA="884e01b4f"  # pinned: CI-only branch = 884e01b4f + swap/CI edits; wheel content == 884e01b4f
-          TAG="sm121a-arm64-wheels-${SHORTSHA}-a4q${{ inputs.release_tag_suffix || '' }}"
+          SHORTSHA="$(git rev-parse --short=9 HEAD)"  # r3 per-page head (17cbdea86)
+          TAG="sm121a-arm64-wheels-${SHORTSHA}-a4q-dg-r3${{ inputs.release_tag_suffix || '' }}"
           WHEEL="$(ls dist/vllm-*.whl)"
-          NOTES="sm_121a (CC 12.1, GB10 / DGX Spark class) arm64 vLLM wheel with A4Q wiring (env-gated, default off: VLLM_NVFP4_A4Q=1 nvf4-QK prefill, VLLM_NVFP4_KV_QF16=1 fp16-Q; needs jethac/flashinfer @ a4q-prototype).
+          NOTES="sm_121a (CC 12.1, GB10 / DGX Spark class) arm64 vLLM wheel: A4Q+QF16+DiffusionGemma NVFP4-KV r3, CERTIFIED per-page/LINEAR_V_SF layout (env-gated, default off: VLLM_NVFP4_A4Q=1 nvf4-QK prefill; VLLM_NVFP4_KV_QF16=1 fp16-Q fidelity default; VLLM_NVFP4_KV_VOSPLIT=1 + VLLM_NVFP4_KV_LINEAR_V_SF=1 for Gemma-4/DG head-512). MATCHED PAIR with jethac/flashinfer @ nvfp4-vosplit-rederive 6d93d894 (0.6.15, install separately). NOT GPU-preflighted by this CI - preflight on real sm121 before use.
           Source: ${{ github.ref_name }} @ ${{ github.sha }}
-          Toolchain: nvcc 13.0 (SBSA repo, build OS auto), torch ${TORCH_VERSION}+cu130, TORCH_CUDA_ARCH_LIST=12.1a, python 3.12. Built on Ubuntu 22.04 / glibc 2.35 to match the Spark r10 serving stack (torch 2.11) -- loads in r10 with no retrofit; bake r11 = r10 + this wheel."
+          Toolchain: nvcc 13.0 (SBSA repo, build OS auto), torch ${TORCH_VERSION}+cu130, TORCH_CUDA_ARCH_LIST=12.1a, python 3.12. Built on Ubuntu 22.04 / glibc 2.35 to match the Spark r10 serving stack (torch 2.11)."
           if gh release view "${TAG}" >/dev/null 2>&1; then
             gh release upload "${TAG}" "${WHEEL}" --clobber
           else
             gh release create "${TAG}" "${WHEEL}" \
-              --title "sm121a arm64 wheels @ ${SHORTSHA}" \
+              --title "sm121a arm64 wheels @ ${SHORTSHA} (a4q-dg-r3 per-page)" \
               --notes "${NOTES}" \
               --prerelease \
-              --target "884e01b4f2510b3f805d1f39920537d0d7b81c38"
+              --target "${{ github.sha }}"
           fi
           echo "RELEASE_URL=https://github.com/${{ github.repository }}/releases/tag/${TAG}" | tee -a "${GITHUB_STEP_SUMMARY}"
