@@ -4,6 +4,7 @@
 
 from dataclasses import dataclass
 from functools import partial
+import inspect
 import json
 import os
 import sys
@@ -826,6 +827,55 @@ def _vllm_nvfp4_a4q_enabled() -> bool:  # A4Q-WIRE
     return os.environ.get("VLLM_NVFP4_A4Q", "0") not in ("", "0")
 
 
+_FI_NVF4_QK_SUPPORTED: bool | None = None
+
+
+def _flashinfer_supports_nvf4_qk() -> bool:  # A4Q-WIRE rebase-compat guard
+    """Whether the installed FlashInfer accepts the A4Q ``use_nvf4_qk`` kwarg.
+
+    The A4Q datapath threads ``use_nvf4_qk`` into several FlashInfer APIs
+    (the prefill/decode wrapper ``.plan()`` and the customize-module JIT gen).
+    Older / upstream FlashInfer builds have no such parameter, so emitting it
+    unconditionally raises ``TypeError`` at engine init (DEFECT 2). Probe the
+    installed signatures once and cache the result; every ``use_nvf4_qk``
+    emission site is gated on this so the wheel degrades gracefully (A4Q simply
+    stays off) on a FlashInfer without A4Q support.
+    """
+    global _FI_NVF4_QK_SUPPORTED
+    if _FI_NVF4_QK_SUPPORTED is not None:
+        return _FI_NVF4_QK_SUPPORTED
+    supported = False
+    try:
+        sig = inspect.signature(BatchPrefillWithPagedKVCacheWrapper.plan)
+        params = sig.parameters
+        supported = "use_nvf4_qk" in params or any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+    except (ValueError, TypeError):
+        supported = False
+    _FI_NVF4_QK_SUPPORTED = supported
+    if not supported:
+        logger.info_once(
+            "FlashInfer build has no use_nvf4_qk support; A4Q disabled "
+            "(rebase-compat guard) and the use_nvf4_qk kwarg will be omitted."
+        )
+    return supported
+
+
+def _a4q_kwarg(value: bool) -> dict[str, bool]:  # A4Q-WIRE rebase-compat guard
+    """Conditionally emit the ``use_nvf4_qk`` kwarg.
+
+    Returns ``{"use_nvf4_qk": value}`` only when the installed FlashInfer
+    supports the parameter; otherwise returns ``{}`` so the kwarg is dropped
+    entirely. Dropping it is safe: A4Q cannot be active on a FlashInfer that
+    lacks the datapath (``_flashinfer_supports_nvf4_qk`` also gates
+    ``a4q_prefill``), so ``value`` is ``False`` in that case anyway.
+    """
+    if _flashinfer_supports_nvf4_qk():
+        return {"use_nvf4_qk": value}
+    return {}
+
+
 def _fa2_nvfp4_prefill_jit_args(
     *,
     q_data_type: torch.dtype,
@@ -908,7 +958,8 @@ def _fa2_nvfp4_prefill_jit_args(
         "use_logits_soft_cap": use_logits_soft_cap,
         "use_fp16_qk_reduction": use_fp16_qk_reduction,
         "fp8_enabled": False,
-        "use_nvf4_qk": use_nvf4_qk,  # A4Q-WIRE
+        # A4Q-WIRE rebase-compat guard: omit on a FlashInfer without A4Q.
+        **_a4q_kwarg(use_nvf4_qk),
     }
     return jit_args, jit_kwargs
 
@@ -1701,6 +1752,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # scope the flag self-disables and the current path runs.
         self.a4q_prefill = (
             _vllm_nvfp4_a4q_enabled()
+            and _flashinfer_supports_nvf4_qk()  # A4Q-WIRE rebase-compat guard
             and self.use_fa2_nvfp4_kv
             and self.head_dim in (128, 256, 512)  # A4Q-WIRE-V2
             and (
@@ -2258,7 +2310,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 o_data_type=o_dtype,
                 fixed_split_size=self.prefill_fixed_split_size,
                 disable_split_kv=self.disable_split_kv,
-                use_nvf4_qk=(not group_mm) and self.a4q_prefill,  # A4Q-WIRE
+                # A4Q-WIRE rebase-compat guard: omit on a FlashInfer without A4Q.
+                **_a4q_kwarg((not group_mm) and self.a4q_prefill),
             )
             wrapper.vllm_prefill_fixed_split_size = self.prefill_fixed_split_size
             wrapper.vllm_disable_split_kv = self.disable_split_kv
@@ -2658,7 +2711,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                             o_data_type=o_dtype,
                             fixed_split_size=self.prefill_fixed_split_size,
                             disable_split_kv=self.disable_split_kv,
-                            use_nvf4_qk=self.a4q_prefill,  # A4Q-WIRE
+                            # A4Q-WIRE rebase-compat guard: omit without A4Q.
+                            **_a4q_kwarg(self.a4q_prefill),
                         )
                         prefill_wrapper.vllm_prefill_fixed_split_size = (
                             self.prefill_fixed_split_size
@@ -2731,7 +2785,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     o_data_type=o_dtype,
                     fixed_split_size=self.decode_fixed_split_size,
                     disable_split_kv=self.disable_split_kv,
-                    use_nvf4_qk=self.a4q_decode,  # A4Q-WIRE-V2
+                    # A4Q-WIRE rebase-compat guard: omit without A4Q.
+                    **_a4q_kwarg(self.a4q_decode),
                 )
                 attn_metadata.decode = FIDecode(wrapper=decode_wrapper)
         return attn_metadata
@@ -4109,7 +4164,8 @@ def fast_plan_decode(
             seq_lens=None,
             fixed_split_size=fixed_split_size,
             disable_split_kv=disable_split_kv,
-            use_nvf4_qk=use_nvf4_qk,  # A4Q-WIRE-V2
+            # A4Q-WIRE rebase-compat guard: omit on a FlashInfer without A4Q.
+            **_a4q_kwarg(use_nvf4_qk),
         )
         self.vllm_first_call = False
         return
