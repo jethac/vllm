@@ -249,7 +249,7 @@ jobs:
           SHORTSHA="$(git rev-parse --short=9 HEAD)"  # r3 per-page head (17cbdea86)
           TAG="sm120a-wheels-${SHORTSHA}-a4q-dg-r3${{ inputs.release_tag_suffix || '' }}"
           WHEEL="$(ls dist/vllm-*.whl)"
-          NOTES="sm_120a (CC 12.0, RTX 5090 / RTX PRO 6000 Blackwell) vLLM wheel: A4Q+QF16+DiffusionGemma NVFP4-KV r3, CERTIFIED per-page/LINEAR_V_SF layout (env-gated, default off: VLLM_NVFP4_A4Q=1 nvf4-QK prefill; VLLM_NVFP4_KV_QF16=1 fp16-Q fidelity default; VLLM_NVFP4_KV_VOSPLIT=1 + VLLM_NVFP4_KV_LINEAR_V_SF=1 for Gemma-4/DG head-512). MATCHED PAIR with jethac/flashinfer @ nvfp4-vosplit-rederive 6d93d894 (0.6.15, install separately). NOT GPU-preflighted by this CI (no GPU on runner) - preflight on real sm120 before use.
+          NOTES="sm_120a (CC 12.0, RTX 5090 / RTX PRO 6000 Blackwell) vLLM wheel: A4Q+QF16+DiffusionGemma NVFP4-KV r3, CERTIFIED per-page/LINEAR_V_SF layout (env-gated, default off: VLLM_NVFP4_A4Q=1 nvf4-QK prefill; VLLM_NVFP4_KV_QF16=1 fp16-Q fidelity default; VLLM_NVFP4_KV_VOSPLIT=1 + VLLM_NVFP4_KV_LINEAR_V_SF=1 for Gemma-4/DG head-512). MATCHED PAIR with jethac/flashinfer @ nvfp4-vosplit-rederive e79f21b6 (0.6.15, install separately). NOT GPU-preflighted by this CI (no GPU on runner) - preflight on real sm120 before use.
           Source: ${{ github.ref_name }} @ ${{ github.sha }}
           Toolchain: nvcc 13.0 (apt cuda-toolkit-13-0), torch ${TORCH_VERSION}+cu130, TORCH_CUDA_ARCH_LIST=12.0a, python 3.12."
           if gh release view "${TAG}" >/dev/null 2>&1; then
